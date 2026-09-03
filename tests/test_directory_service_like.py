@@ -1,8 +1,22 @@
 import uuid
 
 import pytest
+from starlette.responses import Response
 
 from app.v1 import directory_router
+from app.v1 import user_import_jobs
+
+
+class DummyBackgroundTasks:
+    def add_task(self, *_args, **_kwargs):
+        return None
+
+
+def _import_call_kwargs():
+    return {
+        "background_tasks": DummyBackgroundTasks(),  # type: ignore[arg-type]
+        "response": Response(),
+    }
 
 
 @pytest.mark.asyncio
@@ -62,6 +76,11 @@ async def test_users_import_collects_errors(monkeypatch):
 
     monkeypatch.setattr(directory_router, "execute", fake_execute)
     monkeypatch.setattr(directory_router, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(user_import_jobs, "fetch_one", fake_fetch_one)
+    async def fake_ensure(_db):
+        return None
+
+    monkeypatch.setattr(directory_router, "ensure_import_jobs_table", fake_ensure)
     ctx = directory_router.AuthContext(  # type: ignore[attr-defined]
         session_id=uuid.uuid4(),
         person_id=uuid.uuid4(),
@@ -81,8 +100,12 @@ async def test_users_import_collects_errors(monkeypatch):
             return None
 
     payload = directory_router.ImportUsersRequest(users=users, continue_on_error=True)
-    out = await directory_router.import_users_v1(payload=payload, ctx=ctx, db=DummyDB())  # type: ignore[arg-type]
-    assert out["ok"] is False
+    out = await directory_router.import_users_v1(
+        payload=payload,
+        ctx=ctx,
+        db=DummyDB(),  # type: ignore[arg-type]
+        **_import_call_kwargs(),
+    )
     assert len(out["created"]) == 1
     assert len(out["errors"]) == 1
 
@@ -130,6 +153,11 @@ async def test_users_import_accepts_csv_rows(monkeypatch):
 
     monkeypatch.setattr(directory_router, "execute", fake_execute)
     monkeypatch.setattr(directory_router, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(user_import_jobs, "fetch_one", fake_fetch_one)
+    async def fake_ensure(_db):
+        return None
+
+    monkeypatch.setattr(directory_router, "ensure_import_jobs_table", fake_ensure)
     ctx = directory_router.AuthContext(  # type: ignore[attr-defined]
         session_id=uuid.uuid4(),
         person_id=uuid.uuid4(),
@@ -159,8 +187,127 @@ async def test_users_import_accepts_csv_rows(monkeypatch):
         ],
         continue_on_error=True,
     )
-    out = await directory_router.import_users_v1(payload=payload, ctx=ctx, db=DummyDB())  # type: ignore[arg-type]
+    out = await directory_router.import_users_v1(
+        payload=payload,
+        ctx=ctx,
+        db=DummyDB(),  # type: ignore[arg-type]
+        **_import_call_kwargs(),
+    )
     assert out["ok"] is True
     assert out["summary"]["received"] == 1
     assert len(out["created"]) == 1
     assert out["created"][0].get("classroom_linked") is True
+
+
+@pytest.mark.asyncio
+async def test_resolve_or_create_firebase_user_links_existing(monkeypatch):
+    class FakeUser:
+        uid = "firebase-123"
+        display_name = "Old Name"
+
+    def fake_get_user_by_email(email):
+        assert email == "a@a.com"
+        return FakeUser()
+
+    def fake_update_user(uid, **kwargs):
+        assert uid == "firebase-123"
+        assert kwargs["display_name"] == "New Name"
+
+    monkeypatch.setattr(directory_router, "ensure_firebase_initialized", lambda: None)
+    monkeypatch.setattr(directory_router.firebase_auth, "get_user_by_email", fake_get_user_by_email)
+    monkeypatch.setattr(directory_router.firebase_auth, "update_user", fake_update_user)
+
+    uid, mode = directory_router._resolve_or_create_firebase_user(
+        email="a@a.com",
+        full_name="New Name",
+    )
+    assert uid == "firebase-123"
+    assert mode == "linked"
+
+
+@pytest.mark.asyncio
+async def test_sync_user_firebase_links_existing(monkeypatch):
+    calls = {"persist": False}
+
+    async def fake_fetch_one(_db, sql, params):
+        if "FROM vw_profiles" in sql:
+            return {
+                "id": params["id"],
+                "person_id": "p1",
+                "email": "a@a.com",
+                "full_name": "Aluno",
+                "firebase_uid": None,
+            }
+        return None
+
+    async def fake_execute(_db, _sql, _params):
+        return None
+
+    async def fake_persist(_db, *, person_id, firebase_uid):
+        calls["persist"] = True
+        assert person_id == "p1"
+        assert firebase_uid == "firebase-123"
+
+    monkeypatch.setattr(directory_router, "fetch_one", fake_fetch_one)
+    monkeypatch.setattr(directory_router, "execute", fake_execute)
+    monkeypatch.setattr(directory_router, "_persist_person_firebase_link", fake_persist)
+    monkeypatch.setattr(
+        directory_router,
+        "_resolve_or_create_firebase_user",
+        lambda **_: ("firebase-123", "linked"),
+    )
+
+    class DummyDB:
+        async def commit(self):
+            return None
+
+    ctx = directory_router.AuthContext(  # type: ignore[attr-defined]
+        session_id=uuid.uuid4(),
+        person_id=uuid.uuid4(),
+        active_profile_id=uuid.uuid4(),
+        role="platform_admin",
+        school_id=None,
+    )
+    out = await directory_router.sync_user_firebase_v1(
+        user_id=uuid.uuid4(),
+        body=directory_router.FirebaseSyncBody(),
+        ctx=ctx,
+        db=DummyDB(),  # type: ignore[arg-type]
+    )
+    assert out["mode"] == "linked"
+    assert out["firebase_uid"] == "firebase-123"
+    assert calls["persist"] is True
+
+
+@pytest.mark.asyncio
+async def test_sync_user_firebase_already_synced(monkeypatch):
+    async def fake_fetch_one(_db, _sql, _params):
+        return {
+            "id": "pr1",
+            "person_id": "p1",
+            "email": "a@a.com",
+            "full_name": "Aluno",
+            "firebase_uid": "existing-uid",
+        }
+
+    monkeypatch.setattr(directory_router, "fetch_one", fake_fetch_one)
+
+    class DummyDB:
+        async def commit(self):
+            return None
+
+    ctx = directory_router.AuthContext(  # type: ignore[attr-defined]
+        session_id=uuid.uuid4(),
+        person_id=uuid.uuid4(),
+        active_profile_id=uuid.uuid4(),
+        role="platform_admin",
+        school_id=None,
+    )
+    out = await directory_router.sync_user_firebase_v1(
+        user_id=uuid.uuid4(),
+        body=directory_router.FirebaseSyncBody(),
+        ctx=ctx,
+        db=DummyDB(),  # type: ignore[arg-type]
+    )
+    assert out["mode"] == "already_synced"
+    assert out["firebase_uid"] == "existing-uid"

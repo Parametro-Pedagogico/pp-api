@@ -2,10 +2,11 @@
 
 import hashlib
 import json
+import logging
 from typing import Annotated, Any
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, status
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query, Response, status
 from firebase_admin import auth as firebase_auth
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +24,14 @@ from app.v1._scope import (
     is_staff_admin_role,
 )
 from app.v1._sql import execute, fetch_all, fetch_one
+from app.v1.user_import_jobs import (
+    create_async_import_job,
+    ensure_import_jobs_table,
+    get_import_job,
+    normalize_import_payload,
+    process_import_job,
+    run_users_import,
+)
 
 router = APIRouter(tags=["v1-directory"])
 
@@ -119,6 +128,66 @@ def _assert_admin(ctx: AuthContext) -> None:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
 
 
+def _resolve_or_create_firebase_user(
+    *,
+    email: str,
+    full_name: str,
+    temporary_password: str | None = None,
+) -> tuple[str, str]:
+    """Retorna (firebase_uid, mode) onde mode é ``linked`` ou ``created``."""
+    ensure_firebase_initialized()
+    normalized_email = email.strip()
+    try:
+        existing = firebase_auth.get_user_by_email(normalized_email)
+        updates: dict[str, str] = {}
+        if full_name and existing.display_name != full_name:
+            updates["display_name"] = full_name
+        if updates:
+            firebase_auth.update_user(existing.uid, **updates)
+        return existing.uid, "linked"
+    except firebase_auth.UserNotFoundError:
+        kwargs: dict[str, str] = {"email": normalized_email, "display_name": full_name}
+        if temporary_password:
+            kwargs["password"] = temporary_password
+        created = firebase_auth.create_user(**kwargs)
+        return created.uid, "created"
+
+
+async def _persist_person_firebase_link(
+    db: AsyncSession,
+    *,
+    person_id: str,
+    firebase_uid: str,
+) -> None:
+    await execute(
+        db,
+        """
+        UPDATE people
+        SET firebase_uid = :uid,
+            auth_provider = 'firebase',
+            can_login = true,
+            last_sync_at = now(),
+            sync_error = NULL,
+            date_updated = now()
+        WHERE id = CAST(:pid AS uuid)
+        """,
+        {"uid": firebase_uid, "pid": person_id},
+    )
+
+
+async def _delete_firebase_user_safe(firebase_uid: str) -> None:
+    ensure_firebase_initialized()
+    try:
+        firebase_auth.delete_user(firebase_uid)
+    except firebase_auth.UserNotFoundError:
+        return
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY,
+            f"Falha ao remover usuário do Firebase: {exc!s}",
+        ) from exc
+
+
 class UserCreateBody(BaseModel):
     full_name: str
     email: str
@@ -206,25 +275,21 @@ async def _create_user_with_profile(
     firebase_uid = None
     if body.create_firebase_user:
         try:
-            ensure_firebase_initialized()
-            kwargs = {"email": body.email, "display_name": body.full_name}
-            if body.temporary_password:
-                kwargs["password"] = body.temporary_password
-            u = firebase_auth.create_user(**kwargs)
-            firebase_uid = u.uid
+            firebase_uid, _mode = _resolve_or_create_firebase_user(
+                email=body.email,
+                full_name=body.full_name,
+                temporary_password=body.temporary_password,
+            )
+        except HTTPException:
+            raise
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status.HTTP_409_CONFLICT, f"Falha ao criar usuário no Firebase: {exc!s}") from exc
+            raise HTTPException(
+                status.HTTP_409_CONFLICT,
+                f"Falha ao integrar usuário no Firebase: {exc!s}",
+            ) from exc
 
     if firebase_uid:
-        await execute(
-            db,
-            """
-            UPDATE people
-            SET firebase_uid = :uid, last_sync_at = now(), sync_error = NULL
-            WHERE id = CAST(:pid AS uuid)
-            """,
-            {"uid": firebase_uid, "pid": str(person_id)},
-        )
+        await _persist_person_firebase_link(db, person_id=str(person_id), firebase_uid=firebase_uid)
 
     profile_row = await fetch_one(
         db,
@@ -433,11 +498,7 @@ async def delete_user_v1(
     if not still:
         await execute(db, "DELETE FROM people WHERE id = CAST(:pid AS uuid)", {"pid": str(row["person_id"])})
         if row.get("firebase_uid"):
-            try:
-                ensure_firebase_initialized()
-                firebase_auth.delete_user(str(row["firebase_uid"]))
-            except Exception:  # noqa: BLE001
-                pass
+            await _delete_firebase_user_safe(str(row["firebase_uid"]))
     await db.commit()
     return {"ok": True}
 
@@ -503,6 +564,78 @@ async def post_user_password_reset_v1(
         return {"ok": True, "mode": "set_password"}
     link = firebase_auth.generate_password_reset_link(str(row["email"]))
     return {"ok": True, "mode": "reset_link", "reset_link": link}
+
+
+class FirebaseSyncBody(BaseModel):
+    temporary_password: str | None = Field(
+        default=None,
+        description="Senha inicial ao criar conta no Firebase (ignorado se e-mail já existir).",
+    )
+
+
+@router.post("/users/{user_id}/firebase/sync")
+async def sync_user_firebase_v1(
+    user_id: UUID,
+    body: FirebaseSyncBody,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Integra pessoa ao Firebase: vincula por e-mail existente ou cria nova conta."""
+    _assert_admin(ctx)
+    row = await fetch_one(
+        db,
+        """
+        SELECT id, person_id, email, full_name, firebase_uid
+        FROM vw_profiles
+        WHERE id = CAST(:id AS uuid)
+        """,
+        {"id": str(user_id)},
+    )
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "User/profile not found")
+    existing_uid = row.get("firebase_uid")
+    if existing_uid:
+        return {
+            "ok": True,
+            "mode": "already_synced",
+            "firebase_uid": str(existing_uid),
+        }
+    email = (row.get("email") or "").strip()
+    if not email:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "E-mail obrigatório para integrar com Firebase",
+        )
+    try:
+        firebase_uid, mode = _resolve_or_create_firebase_user(
+            email=email,
+            full_name=str(row.get("full_name") or ""),
+            temporary_password=body.temporary_password,
+        )
+        await _persist_person_firebase_link(
+            db,
+            person_id=str(row["person_id"]),
+            firebase_uid=firebase_uid,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        await execute(
+            db,
+            """
+            UPDATE people
+            SET sync_error = :err, date_updated = now()
+            WHERE id = CAST(:pid AS uuid)
+            """,
+            {"err": str(exc), "pid": str(row["person_id"])},
+        )
+        await db.commit()
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"Falha ao integrar usuário no Firebase: {exc!s}",
+        ) from exc
+    await db.commit()
+    return {"ok": True, "mode": mode, "firebase_uid": firebase_uid}
 
 
 def _norm_role_str(role: str | None) -> str:
@@ -605,6 +738,7 @@ class ImportUsersRequest(BaseModel):
     skip_existing_email: bool = True
     create_firebase_user: bool = True
     idempotency_key: str | None = None
+    async_mode: bool = False
 
     @model_validator(mode="after")
     def _exactly_one_source(self) -> "ImportUsersRequest":
@@ -620,157 +754,61 @@ async def import_users_v1(
     payload: ImportUsersRequest,
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    background_tasks: BackgroundTasks,
+    response: Response,
 ):
     _assert_admin(ctx)
-    bodies: list[tuple[int, UserCreateBody, dict[str, Any]]] = []
-    errors: list[dict[str, Any]] = []
-    if payload.rows is not None:
-        for i, raw in enumerate(payload.rows):
-            try:
-                bodies.append(
-                    (
-                        i,
-                        _dict_csv_row_to_user_create(
-                            raw,
-                            default_create_firebase_user=payload.create_firebase_user,
-                        ),
-                        raw,
-                    )
-                )
-            except ValueError as ve:
-                errors.append({"index": i, "email": raw.get("email"), "error": str(ve)})
-                if not payload.continue_on_error:
-                    break
-        total_in = len(payload.rows)
-    else:
-        users = payload.users or []
-        for i, u in enumerate(users):
-            bodies.append((i, u, {}))
-        total_in = len(users)
+    await ensure_import_jobs_table(db)
 
-    await execute(
-        db,
-        """
-        CREATE TABLE IF NOT EXISTS app_import_jobs (
-          id text PRIMARY KEY,
-          payload_hash text NOT NULL,
-          result_json jsonb NOT NULL,
-          created_at timestamptz NOT NULL DEFAULT now()
-        )
-        """,
-        {},
-    )
-    if payload.rows is not None:
-        normalized_payload = json.dumps(
-            {
-                "rows": payload.rows,
-                "create_firebase_user": payload.create_firebase_user,
-            },
-            sort_keys=True,
-            default=str,
-            ensure_ascii=True,
-        )
-    else:
-        normalized_payload = json.dumps(
-            [u.model_dump(mode="json") for u in (payload.users or [])],
-            sort_keys=True,
-            ensure_ascii=True,
-        )
-    payload_hash = hashlib.sha256(normalized_payload.encode("utf-8")).hexdigest()
+    if payload.async_mode:
+        job = await create_async_import_job(db, payload, idempotency_key=payload.idempotency_key)
+        background_tasks.add_task(process_import_job, job["job_id"])
+        response.status_code = status.HTTP_202_ACCEPTED
+        return job
+
+    payload_hash, payload_body = normalize_import_payload(payload)
     if payload.idempotency_key:
         existing = await fetch_one(
             db,
-            "SELECT payload_hash, result_json FROM app_import_jobs WHERE id = :id",
+            """
+            SELECT payload_hash, result_json, status
+            FROM app_import_jobs WHERE id = :id
+            """,
             {"id": payload.idempotency_key},
         )
-        if existing:
-            if existing["payload_hash"] != payload_hash:
-                raise HTTPException(status.HTTP_409_CONFLICT, "idempotency_key reutilizada com payload diferente")
+        if existing and existing["payload_hash"] == payload_hash and existing.get("result_json"):
             return {
                 **existing["result_json"],
                 "idempotency": {"reused": True, "idempotency_key": payload.idempotency_key},
             }
+        if existing and existing["payload_hash"] != payload_hash:
+            raise HTTPException(status.HTTP_409_CONFLICT, "idempotency_key reutilizada com payload diferente")
 
-    created: list[dict[str, Any]] = []
-    seen_emails: set[str] = set()
-    for i, u, orig in bodies:
-        email_key = (u.email or "").strip().lower()
-        if not email_key:
-            errors.append({"index": i, "email": u.email, "error": "email obrigatório"})
-            if not payload.continue_on_error:
-                break
-            continue
-        if email_key in seen_emails:
-            errors.append({"index": i, "email": u.email, "error": "email duplicado no payload"})
-            if not payload.continue_on_error:
-                break
-            continue
-        seen_emails.add(email_key)
-        if payload.skip_existing_email:
-            exists = await fetch_one(
-                db,
-                "SELECT id FROM people WHERE lower(email) = :email LIMIT 1",
-                {"email": email_key},
-            )
-            if exists:
-                created.append({"index": i, "profile_id": None, "email": u.email, "skipped": "existing_email"})
-                continue
-        try:
-            out = await _create_user_with_profile(db, body=u)
-            pid = UUID(str(out["id"]))
-            entry: dict[str, Any] = {"index": i, "profile_id": out["id"], "email": out.get("email")}
-            class_id = _parse_uuid_opt(orig.get("classroom_id")) if orig else None
-            if class_id:
-                try:
-                    await _link_import_profile_to_classroom(
-                        db, role=u.role, profile_id=pid, classroom_id=class_id
-                    )
-                    await db.commit()
-                    entry["classroom_linked"] = True
-                except Exception as link_exc:  # noqa: BLE001
-                    await db.rollback()
-                    errors.append(
-                        {
-                            "index": i,
-                            "email": u.email,
-                            "error": f"Usuário criado; falha ao vincular turma: {link_exc!s}",
-                        }
-                    )
-            created.append(entry)
-        except Exception as exc:  # noqa: BLE001
-            await db.rollback()
-            errors.append({"index": i, "email": u.email, "error": str(exc)})
-            if not payload.continue_on_error:
-                break
-    result = {
-        "ok": len(errors) == 0,
-        "created": created,
-        "errors": errors,
-        "summary": {
-            "received": total_in,
-            "created_count": len([x for x in created if not x.get("skipped")]),
-            "skipped_count": len([x for x in created if x.get("skipped")]),
-            "error_count": len(errors),
-            "linked_count": len([x for x in created if x.get("classroom_linked")]),
-        },
-    }
+    result = await run_users_import(db, payload)
     if payload.idempotency_key:
         await execute(
             db,
             """
-            INSERT INTO app_import_jobs (id, payload_hash, result_json)
-            VALUES (:id, :payload_hash, CAST(:result_json AS jsonb))
-            ON CONFLICT (id) DO NOTHING
+            INSERT INTO app_import_jobs (id, payload_hash, payload_json, result_json, status, finished_at)
+            VALUES (:id, :payload_hash, CAST(:payload_json AS jsonb), CAST(:result_json AS jsonb), 'completed', now())
+            ON CONFLICT (id) DO UPDATE SET
+              payload_hash = EXCLUDED.payload_hash,
+              payload_json = EXCLUDED.payload_json,
+              result_json = EXCLUDED.result_json,
+              status = 'completed',
+              finished_at = now()
             """,
             {
                 "id": payload.idempotency_key,
                 "payload_hash": payload_hash,
+                "payload_json": json.dumps(payload_body, ensure_ascii=True),
                 "result_json": json.dumps(result, ensure_ascii=True),
             },
         )
     await db.commit()
     return {
         **result,
+        "async": False,
         "idempotency": {
             "reused": False,
             "idempotency_key": payload.idempotency_key,
@@ -785,25 +823,9 @@ async def get_import_job_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Base para processamento assíncrono futuro: consulta status/resultado por idempotency key."""
+    """Consulta status/resultado de import (síncrono ou assíncrono)."""
     _assert_admin(ctx)
-    row = await fetch_one(
-        db,
-        """
-        SELECT id, payload_hash, result_json, created_at
-        FROM app_import_jobs
-        WHERE id = :id
-        """,
-        {"id": idempotency_key},
-    )
-    if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Import job não encontrado")
-    return {
-        "idempotency_key": row["id"],
-        "payload_hash": row["payload_hash"],
-        "result": row["result_json"],
-        "created_at": row["created_at"],
-    }
+    return await get_import_job(db, idempotency_key)
 
 
 @router.get("/students")
