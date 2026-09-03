@@ -19,7 +19,7 @@ async def hardcut_readiness_v1(ctx: Annotated[AuthContext, Depends(get_auth_cont
         {"domain": "assessments/schedules/attendance", "status": "ready_for_hard_cut", "notes": "Roster, assessment_school, turma↔avaliação/agenda; presença admin+professor da turma; vw_classroom_students."},
         {"domain": "reports/dashboards", "status": "ready_with_caveats", "notes": "Cobertos; validar KPIs esperados por produto."},
         {"domain": "teacher portal", "status": "ready_with_caveats", "notes": "Coberto; monitorar cenários de alta cardinalidade."},
-        {"domain": "exam", "status": "ready_with_caveats", "notes": "Fluxo aluno via `/v1/exam/*` (linear); IRT/parada adaptativa da edge antiga não portada."},
+        {"domain": "exam", "status": "ready_for_hard_cut", "notes": "Fluxo aluno via `/v1/exam/*`; engine linear + adaptativa IRT/CAT (SPEC-EXAM-002)."},
         {"domain": "realtime", "status": "not_ready_for_hard_cut", "notes": "Não implementado no backend v1."},
     ]
     return {

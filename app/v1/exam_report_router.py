@@ -23,6 +23,17 @@ from app.v1._scope import (
 from app.v1._sql import execute, fetch_all, fetch_one
 from app.v1.attendance_sheet_storage import load_attendance_sheet_bytes
 from app.v1.directory_router import _student_scope_read
+from app.v1.exam_adaptive import (
+    AdaptiveItem,
+    AdaptiveResponse,
+    adaptive_progress_block,
+    estimate_theta,
+    is_adaptive_assessment_type,
+    parse_adaptive_config,
+    parse_item_parameters,
+    select_next_item,
+    should_stop_exam,
+)
 from app.v1.macro_report import (
     macro_components_report,
     macro_components_report_for_classrooms,
@@ -302,6 +313,212 @@ async def _load_questions_and_answered(
     return questions, answered_ids
 
 
+async def _load_assessment_exam_meta(db: AsyncSession, assessment_id: UUID) -> dict[str, Any] | None:
+    return await fetch_one(
+        db,
+        """
+        SELECT id, type, est_theta, min_error, min_items, max_items
+        FROM assessments
+        WHERE id = CAST(:aid AS uuid)
+        """,
+        {"aid": str(assessment_id)},
+    )
+
+
+async def _load_adaptive_item_bank(db: AsyncSession, assessment_id: UUID) -> list[AdaptiveItem]:
+    rows = await fetch_all(
+        db,
+        """
+        SELECT qa.question_id, qa.order_index, qi.parameters
+        FROM questions_assessments qa
+        JOIN question_item qi ON qi.id = qa.question_id
+        WHERE qa.assessment_id = CAST(:aid AS uuid)
+        ORDER BY qa.order_index
+        """,
+        {"aid": str(assessment_id)},
+    )
+    items: list[AdaptiveItem] = []
+    for row in rows:
+        qid = str(row.get("question_id") or "")
+        if not qid:
+            continue
+        a, b, c = parse_item_parameters(row.get("parameters"), order_index=int(row.get("order_index") or 0))
+        items.append(
+            AdaptiveItem(
+                question_id=qid,
+                order_index=int(row.get("order_index") or 0),
+                discrimination=a,
+                difficulty=b,
+                guessing=c,
+            )
+        )
+    return items
+
+
+async def _load_adaptive_responses(
+    db: AsyncSession,
+    *,
+    assessment_id: UUID,
+    student_id: UUID,
+) -> tuple[list[AdaptiveResponse], set[str], int | None]:
+    rows = await fetch_all(
+        db,
+        """
+        SELECT DISTINCT ON (qsr.question_id)
+               qsr.question_id,
+               qa.is_correct,
+               qsr.order_index
+        FROM question_student_responsed qsr
+        JOIN question_alternative qa ON qa.id = qsr.response_id
+        WHERE qsr.assessment_id = CAST(:aid AS uuid)
+          AND qsr.student_id = CAST(:sid AS uuid)
+          AND qsr.response_id IS NOT NULL
+        ORDER BY qsr.question_id, qsr.updated_at DESC NULLS LAST
+        """,
+        {"aid": str(assessment_id), "sid": str(student_id)},
+    )
+    responses: list[AdaptiveResponse] = []
+    answered_ids: set[str] = set()
+    orders: list[int] = []
+    for row in rows:
+        qid = str(row.get("question_id") or "")
+        if not qid:
+            continue
+        answered_ids.add(qid)
+        responses.append(AdaptiveResponse(qid, bool(row.get("is_correct"))))
+        if row.get("order_index") is not None:
+            orders.append(int(row["order_index"]))
+    last_order = max(orders) if orders else None
+    return responses, answered_ids, last_order
+
+
+def _adaptive_exam_base_out(
+    body: "NextQuestionBody",
+    *,
+    student_id: UUID,
+    prog: dict[str, Any],
+    finished: bool,
+    status: str | None = None,
+) -> dict[str, Any]:
+    return {
+        "assessment_id": str(body.assessment_id),
+        "student_id": str(student_id),
+        "classroom_id": str(body.classroom_id) if body.classroom_id else None,
+        "schedule_id": str(body.schedule_id) if body.schedule_id else None,
+        **prog,
+        "finished": finished,
+        "completed": finished,
+        "status": status,
+        "message": None,
+        "question": None,
+        "order_index": None,
+        "next_question": None,
+    }
+
+
+async def _exam_next_question_adaptive(
+    db: AsyncSession,
+    body: "NextQuestionBody",
+    *,
+    student_id: UUID,
+    assessment_meta: dict[str, Any],
+) -> dict[str, Any]:
+    config = parse_adaptive_config(assessment_meta)
+    item_bank = await _load_adaptive_item_bank(db, body.assessment_id)
+    if not item_bank:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assessment sem questões")
+
+    items_by_id = {it.question_id: it for it in item_bank}
+    responses, answered_ids, last_answered_order = await _load_adaptive_responses(
+        db,
+        assessment_id=body.assessment_id,
+        student_id=student_id,
+    )
+
+    if body.question_id is not None and body.response_id is not None:
+        await _upsert_question_student_response(
+            db,
+            student_id=student_id,
+            assessment_id=body.assessment_id,
+            question_id=body.question_id,
+            response_id=body.response_id,
+            schedule_id=body.schedule_id,
+        )
+        await db.commit()
+        responses, answered_ids, last_answered_order = await _load_adaptive_responses(
+            db,
+            assessment_id=body.assessment_id,
+            student_id=student_id,
+        )
+        theta, standard_error = estimate_theta(responses, items_by_id, initial_theta=config.initial_theta)
+        answered_count = len(answered_ids)
+        prog = adaptive_progress_block(
+            answered_count=answered_count,
+            config=config,
+            last_answered_order=last_answered_order,
+        )
+        prog["theta"] = round(theta, 4)
+        prog["standard_error"] = round(standard_error, 4)
+        base = _adaptive_exam_base_out(body, student_id=student_id, prog=prog, finished=False, status="updated")
+        if should_stop_exam(answered_count, standard_error, config):
+            base["finished"] = True
+            base["completed"] = True
+        return base
+
+    if body.question_id is not None and body.response_id is None:
+        item = items_by_id.get(str(body.question_id))
+        if not item:
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Questão não encontrada nesta avaliação")
+        prog = adaptive_progress_block(
+            answered_count=len(answered_ids),
+            config=config,
+            last_answered_order=last_answered_order,
+        )
+        q_uuid = UUID(item.question_id)
+        app_q = await _build_app_question(db, body.assessment_id, q_uuid, item.order_index)
+        if not app_q:
+            raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Falha ao montar payload da questão")
+        return {
+            **_adaptive_exam_base_out(body, student_id=student_id, prog=prog, finished=False),
+            "question": app_q,
+            "order_index": item.order_index,
+            "next_question": {"question_id": item.question_id, "order_index": item.order_index},
+        }
+
+    theta, standard_error = estimate_theta(responses, items_by_id, initial_theta=config.initial_theta)
+    answered_count = len(answered_ids)
+    prog = adaptive_progress_block(
+        answered_count=answered_count,
+        config=config,
+        last_answered_order=last_answered_order,
+    )
+    prog["theta"] = round(theta, 4)
+    prog["standard_error"] = round(standard_error, 4)
+
+    finished = should_stop_exam(answered_count, standard_error, config) or answered_count >= len(item_bank)
+    base_out = _adaptive_exam_base_out(body, student_id=student_id, prog=prog, finished=finished)
+    if finished:
+        return base_out
+
+    next_item = select_next_item(theta, item_bank, answered_ids)
+    if not next_item:
+        base_out["finished"] = True
+        base_out["completed"] = True
+        return base_out
+
+    q_uuid = UUID(next_item.question_id)
+    app_q = await _build_app_question(db, body.assessment_id, q_uuid, next_item.order_index)
+    if not app_q:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Falha ao montar payload da questão")
+    base_out["question"] = app_q
+    base_out["order_index"] = next_item.order_index
+    base_out["next_question"] = {
+        "question_id": next_item.question_id,
+        "order_index": next_item.order_index,
+    }
+    return base_out
+
+
 class NextQuestionBody(BaseModel):
     assessment_id: UUID
     student_id: UUID | None = None
@@ -311,11 +528,11 @@ class NextQuestionBody(BaseModel):
     response_id: UUID | None = None
     assessment_result_id: UUID | None = Field(
         default=None,
-        description="ID legado; ignorado pela engine v1 (linear).",
+        description="ID legado; ignorado pela engine v1.",
     )
     assessment_type: str | None = Field(
         default=None,
-        description="Tipo da prova; ignorado pela engine v1 (sem IRT adaptativo nesta rodada).",
+        description="Tipo explícito da prova (ex.: adaptive); sobrescreve assessments.type.",
     )
 
 
@@ -325,11 +542,7 @@ async def exam_next_question_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    """Próxima questão (ordem fixa) + persistência de resposta; contrato alinhado ao app (ex-edge).
-
-    Engine **linear**: próxima não respondida em `order_index`. Não replica IRT/parada adaptativa
-    da edge legada (ver documentação).
-    """
+    """Próxima questão + persistência de resposta; linear ou adaptativa (IRT/CAT)."""
     student_id = body.student_id or ctx.active_profile_id
     if str(student_id) != str(ctx.active_profile_id) and not is_admin_like(ctx.role):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Escopo")
@@ -337,6 +550,20 @@ async def exam_next_question_v1(
     if body.classroom_id and not cscope["is_admin_like"]:
         if str(body.classroom_id) not in {str(x) for x in (cscope["effective_classroom_ids"] or [])}:
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Classroom fora do escopo")
+
+    assessment_meta = await _load_assessment_exam_meta(db, body.assessment_id)
+    if not assessment_meta:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assessment não encontrado")
+
+    if is_adaptive_assessment_type(assessment_meta.get("type"), body.assessment_type):
+        if body.assessment_result_id:
+            logger.debug("exam next-question: assessment_result_id ignored in adaptive engine")
+        return await _exam_next_question_adaptive(
+            db,
+            body,
+            student_id=student_id,
+            assessment_meta=assessment_meta,
+        )
 
     if body.assessment_result_id:
         logger.debug("exam next-question: assessment_result_id ignored in v1 linear engine")
@@ -1134,12 +1361,21 @@ async def teacher_macro_assessments_v1(
            MIN(v.type) AS type,
            MIN(v.year) AS year,
            bool_or(v.is_active) AS is_active,
+           MIN(ma.start_date) AS start_date,
+           MIN(ma.end_date) AS end_date,
+           bool_or(
+             ma.start_date IS NOT NULL
+             AND ma.end_date IS NOT NULL
+             AND ma.start_date <= (now() AT TIME ZONE 'utc')
+             AND ma.end_date >= (now() AT TIME ZONE 'utc')
+           ) AS scheduling_available,
            COALESCE(SUM(v.pending), 0)::int AS pending,
            COALESCE(SUM(v.completed), 0)::int AS completed,
            COALESCE(SUM(v.did_not_deliver), 0)::int AS did_not_deliver,
            {macro_schedule_cols}
     FROM vw_macro_assessment_summary v
     JOIN classrooms c ON c.id = v.classroom_id
+    LEFT JOIN macro_assessments ma ON ma.id = v.macro_assessment_id
     WHERE v.macro_assessment_id IS NOT NULL
       {ay_filter}
       {_scope_sql("v")}
@@ -1157,6 +1393,15 @@ async def teacher_macro_assessments_v1(
     SELECT vas.assessment_id, vas.classroom_id, vas.school_id,
            c.name AS classroom_name,
            vas.title, vas.description, vas.type, vas.year, vas.is_active,
+           ash.start_availability AS start_date,
+           ash.end_availability AS end_date,
+           (
+             ash.start_availability IS NOT NULL
+             AND ash.end_availability IS NOT NULL
+             AND ash.start_availability <= (now() AT TIME ZONE 'utc')
+             AND ash.end_availability >= (now() AT TIME ZONE 'utc')
+             AND ash.active = true
+           ) AS scheduling_available,
            COALESCE(vas.pending, 0)::int AS pending,
            COALESCE(vas.completed, 0)::int AS completed,
            COALESCE(vas.did_not_deliver, 0)::int AS did_not_deliver,
@@ -1164,6 +1409,8 @@ async def teacher_macro_assessments_v1(
     FROM vw_assessment_summary vas
     JOIN classrooms c ON c.id = vas.classroom_id
     JOIN assessments a ON a.id = vas.assessment_id
+    JOIN assessment_school ash
+      ON ash.assessment_id = a.id AND ash.school_id = c.school_id
     WHERE a.macro_assessment_id IS NULL
       {ay_filter}
       {_scope_sql("vas")}
@@ -1189,6 +1436,7 @@ async def teacher_macro_assessments_v1(
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
                 **_schedule_status_fields(r),
+                **_scheduling_window_fields(r),
             }
         )
     for r in legacy_rows:
@@ -1209,6 +1457,7 @@ async def teacher_macro_assessments_v1(
                 "completed": int(r.get("completed") or 0),
                 "didNotDeliver": int(r.get("did_not_deliver") or 0),
                 **_schedule_status_fields(r),
+                **_scheduling_window_fields(r),
             }
         )
     items.sort(key=lambda x: ((x.get("classroomName") or "").lower(), (x["title"] or "").lower()))

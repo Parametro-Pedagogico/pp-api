@@ -1209,13 +1209,31 @@ async def assert_can_read_schedule_report(
     await assert_actor_can_read_classroom(db, ctx, UUID(str(row["classroom_id"])))
 
 
+async def _schedule_has_attendance_list(db: AsyncSession, schedule_id: UUID) -> bool:
+    row = await fetch_one(
+        db,
+        """
+        SELECT 1
+        FROM assessment_attendance_list
+        WHERE assessment_schedules_id = CAST(:sid AS uuid)
+        LIMIT 1
+        """,
+        {"sid": str(schedule_id)},
+    )
+    return bool(row)
+
+
 async def assessment_schedule_report_bundle(
     db: AsyncSession,
     *,
     schedule_id: UUID,
     academic_year_id: UUID,
 ) -> dict[str, Any]:
-    """Substitui `TeacherService.getAssessmentReport` (schedule + resultados + estatísticas)."""
+    """Substitui `TeacherService.getAssessmentReport` (schedule + resultados + estatísticas).
+
+    Escopo de alunos (SPEC-RPT-002): se existir lista de presença no agendamento,
+    inclui apenas alunos com status != 'out'; senão, todos matriculados publicados.
+    """
     sched = await fetch_one(
         db,
         """
@@ -1238,21 +1256,76 @@ async def assessment_schedule_report_bundle(
     if not sched:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Schedule not found for this academic year")
 
-    results = await fetch_all(
-        db,
-        """
-        SELECT ar.*,
+    classroom_id = sched.get("classroom_id")
+    assessment_id = sched.get("assessment_id")
+    use_attendance = await _schedule_has_attendance_list(db, schedule_id)
+    student_scope = "attendance" if use_attendance else "enrollment"
+
+    if use_attendance:
+        results_sql = """
+        SELECT ar.id AS result_id,
+               aal.student_id,
+               ar.schedule_id,
+               ar.assessment_id,
+               ar.classroom_id,
+               ar.started_at,
+               ar.submitted_at,
+               ar.score,
+               ar.feedback,
+               COALESCE(ar.status, 'pending') AS status,
                p.full_name AS student_full_name,
                p.email AS student_email
-        FROM assessment_results ar
-        LEFT JOIN vw_profiles p ON p.id = ar.student_id
-        WHERE ar.schedule_id = CAST(:sid AS uuid)
+        FROM assessment_attendance_list aal
+        INNER JOIN profiles pr ON pr.id = aal.student_id
+        INNER JOIN people ppl ON ppl.id = pr.person_id
+        LEFT JOIN assessment_results ar
+          ON ar.student_id = aal.student_id
+         AND ar.assessment_id = CAST(:aid AS uuid)
+         AND ar.classroom_id = CAST(:cid AS uuid)
+        LEFT JOIN vw_profiles p ON p.id = aal.student_id
+        WHERE aal.assessment_schedules_id = CAST(:sid AS uuid)
+          AND aal.status IS DISTINCT FROM 'out'::attendance_list
+          AND ppl.status = 'published'
         ORDER BY p.full_name NULLS LAST, ar.submitted_at DESC NULLS LAST
-        """,
-        {"sid": str(schedule_id)},
+        """
+    else:
+        results_sql = """
+        SELECT ar.id AS result_id,
+               cs.student_id,
+               ar.schedule_id,
+               ar.assessment_id,
+               ar.classroom_id,
+               ar.started_at,
+               ar.submitted_at,
+               ar.score,
+               ar.feedback,
+               COALESCE(ar.status, 'pending') AS status,
+               p.full_name AS student_full_name,
+               p.email AS student_email
+        FROM classroom_students cs
+        INNER JOIN profiles pr ON pr.id = cs.student_id
+        INNER JOIN people ppl ON ppl.id = pr.person_id
+        LEFT JOIN assessment_results ar
+          ON ar.student_id = cs.student_id
+         AND ar.assessment_id = CAST(:aid AS uuid)
+         AND ar.classroom_id = CAST(:cid AS uuid)
+        LEFT JOIN vw_profiles p ON p.id = cs.student_id
+        WHERE cs.classroom_id = CAST(:cid AS uuid)
+          AND ppl.status = 'published'
+        ORDER BY p.full_name NULLS LAST, ar.submitted_at DESC NULLS LAST
+        """
+
+    results = await fetch_all(
+        db,
+        results_sql,
+        {"sid": str(schedule_id), "aid": str(assessment_id), "cid": str(classroom_id)},
     )
     total = len(results)
-    completed = sum(1 for r in results if str(r.get("status") or "").lower() in ("submitted", "graded"))
+    completed = sum(
+        1
+        for r in results
+        if str(r.get("status") or "").lower() in ("submitted", "graded", "completed")
+    )
     total_score = 0.0
     scored = 0
     for r in results:
@@ -1279,13 +1352,27 @@ async def assessment_schedule_report_bundle(
     }
     out_results = []
     for r in results:
-        row = dict(r)
-        row["profiles"] = {
-            "id": row.get("student_id"),
-            "full_name": row.pop("student_full_name", None),
-            "email": row.pop("student_email", None),
-        }
-        out_results.append(row)
+        result_id = r.get("result_id")
+        student_id = r.get("student_id")
+        out_results.append(
+            {
+                "id": result_id or student_id,
+                "student_id": student_id,
+                "schedule_id": r.get("schedule_id"),
+                "assessment_id": r.get("assessment_id"),
+                "classroom_id": r.get("classroom_id"),
+                "started_at": r.get("started_at"),
+                "submitted_at": r.get("submitted_at"),
+                "score": r.get("score"),
+                "feedback": r.get("feedback"),
+                "status": r.get("status") or "pending",
+                "profiles": {
+                    "id": student_id,
+                    "full_name": r.get("student_full_name"),
+                    "email": r.get("student_email"),
+                },
+            }
+        )
 
     return {
         "schedule": schedule_payload,
@@ -1294,5 +1381,6 @@ async def assessment_schedule_report_bundle(
             "total_students": total,
             "completed_count": completed,
             "average_score": round(avg, 2),
+            "student_scope": student_scope,
         },
     }
