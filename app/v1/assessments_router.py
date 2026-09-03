@@ -92,10 +92,16 @@ def _shape_assessment_schedule_list_item(row: dict[str, Any]) -> dict[str, Any]:
         "grades": ({"name": gname} if gname is not None else None),
         "academic_years": ({"year": ayear} if ayear is not None else None),
     }
-    if atitle is not None or aid is not None:
+    matitle = r.pop("_macro_assessment_title", None)
+    mid = r.pop("macro_assessment_id", None)
+    if atitle is not None or aid is not None or mid is not None:
         r["assessments"] = {
             "id": str(aid) if aid is not None else None,
             "title": atitle,
+            "macro_assessment_id": str(mid) if mid is not None else None,
+            "macro_assessments": (
+                {"id": str(mid), "title": matitle} if mid is not None and matitle is not None else None
+            ),
         }
     return r
 
@@ -551,10 +557,19 @@ async def list_schedules_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
     assessment_id: UUID | None = Query(None),
     classroom_id: UUID | None = Query(None),
+    school_id: UUID | None = Query(
+        None,
+        description="Recorte por escola da turma (turmas com classrooms.school_id igual). Admin: valida escopo; gestor: escola no escopo efetivo.",
+    ),
+    macro_assessment_id: UUID | None = Query(
+        None,
+        description="Filtra agendamentos cujo caderno pertence à macro avaliação indicada.",
+    ),
     academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
     pg: Annotated[PageArgs, Depends(pagination_params)] = PageArgs(1, 50),
 ):
     effective_ay = await resolve_academic_year_id(db, academic_year_id)
+    sscope = await get_effective_school_scope(db, ctx)
     cscope = await get_effective_classroom_scope(db, ctx)
     sql = """
 SELECT
@@ -567,12 +582,15 @@ SELECT
   ass.created_at,
   ass.school_id,
   a.title AS _assessment_title,
+  a.macro_assessment_id,
+  ma.title AS _macro_assessment_title,
   c."name" AS _classroom_name,
   c.code AS _classroom_code,
   g."name" AS _grade_name,
   ay."year" AS _academic_year_year
 FROM assessment_schedules ass
 JOIN assessments a ON a.id = ass.assessment_id
+LEFT JOIN macro_assessments ma ON ma.id = a.macro_assessment_id
 JOIN classrooms c ON c.id = ass.classroom_id
 JOIN grades g ON g.id = c.grade_id
 JOIN academic_years ay ON ay.id = c.academic_year_id
@@ -587,6 +605,18 @@ WHERE 1=1
     if classroom_id:
         sql += " AND ass.classroom_id = CAST(:cid AS uuid)"
         params["cid"] = str(classroom_id)
+    if macro_assessment_id:
+        sql += " AND a.macro_assessment_id = CAST(:maid AS uuid)"
+        params["maid"] = str(macro_assessment_id)
+    if school_id:
+        if not sscope["is_admin_like"]:
+            if str(school_id) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "Escola fora do escopo")
+        sql += " AND c.school_id = CAST(:filter_school AS uuid)"
+        params["filter_school"] = str(school_id)
+    elif not sscope["is_admin_like"]:
+        sql += " AND c.school_id = ANY(CAST(:scope_school_ids AS uuid[]))"
+        params["scope_school_ids"] = [str(x) for x in (sscope["effective_school_ids"] or [])]
     if not cscope["is_admin_like"]:
         sql += " AND ass.classroom_id = ANY(CAST(:_scope_cids AS uuid[]))"
         params["_scope_cids"] = [str(x) for x in (cscope["effective_classroom_ids"] or [])]
@@ -782,6 +812,24 @@ async def get_schedule_roster_v1(
 ):
     """Contexto do agendamento: schedule, turma, professores, alunos matriculados (classroom_students) e presença."""
     sch = await get_schedule_v1(schedule_id, ctx, db, academic_year_id=academic_year_id)
+    aid = sch.get("assessment_id")
+    assessment_meta = await fetch_one(
+        db,
+        """
+        SELECT a.title, a.macro_assessment_id, ma.title AS macro_title
+        FROM assessments a
+        LEFT JOIN macro_assessments ma ON ma.id = a.macro_assessment_id
+        WHERE a.id = CAST(:aid AS uuid)
+        """,
+        {"aid": str(aid)},
+    )
+    if assessment_meta:
+        sch = {
+            **sch,
+            "macro_assessment_id": assessment_meta.get("macro_assessment_id"),
+            "_macro_assessment_title": assessment_meta.get("macro_title"),
+            "_assessment_title": assessment_meta.get("title") or sch.get("_assessment_title"),
+        }
     cid = sch["classroom_id"]
     classroom = await fetch_one(db, "SELECT * FROM classrooms WHERE id = CAST(:id AS uuid)", {"id": str(cid)})
     teachers = await fetch_all(
@@ -1546,6 +1594,640 @@ async def download_schedule_attendance_sheet_pdf_v1(
     return Response(
         content=pdf_bytes,
         media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+async def _resolve_macro_classroom_schedules(
+    db: AsyncSession,
+    ctx: AuthContext,
+    *,
+    macro_assessment_id: UUID,
+    classroom_id: UUID,
+    academic_year_id: UUID | None,
+) -> tuple[list[dict[str, Any]], dict[str, Any], dict[str, Any]]:
+    """Agendamentos de todos os cadernos da macro numa turma."""
+    effective_ay = await resolve_academic_year_id(db, academic_year_id)
+    cscope = await get_effective_classroom_scope(db, ctx)
+
+    classroom = await fetch_one(
+        db,
+        """
+        SELECT c.*, g.name AS _grade_name
+        FROM classrooms c
+        LEFT JOIN grades g ON g.id = c.grade_id
+        WHERE c.id = CAST(:cid AS uuid)
+          AND c.academic_year_id = CAST(:ay AS uuid)
+        """,
+        {"cid": str(classroom_id), "ay": str(effective_ay)},
+    )
+    if not classroom:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada")
+
+    if not cscope["is_admin_like"] and str(classroom_id) not in {
+        str(x) for x in (cscope["effective_classroom_ids"] or [])
+    }:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
+
+    macro = await fetch_one(
+        db,
+        "SELECT id, title FROM macro_assessments WHERE id = CAST(:id AS uuid)",
+        {"id": str(macro_assessment_id)},
+    )
+    if not macro:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Macro avaliação não encontrada")
+
+    schedules = await fetch_all(
+        db,
+        """
+        SELECT
+          ass.id,
+          ass.assessment_id,
+          ass.classroom_id,
+          ass.start_time,
+          ass.end_time,
+          a.title AS _assessment_title
+        FROM assessment_schedules ass
+        JOIN assessments a ON a.id = ass.assessment_id
+        WHERE a.macro_assessment_id = CAST(:maid AS uuid)
+          AND ass.classroom_id = CAST(:cid AS uuid)
+        ORDER BY a.title ASC NULLS LAST, ass.created_at ASC
+        """,
+        {"maid": str(macro_assessment_id), "cid": str(classroom_id)},
+    )
+    if not schedules:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Nenhum agendamento desta macro para a turma indicada.",
+        )
+
+    if not is_staff_admin_role(ctx.role):
+        can_manage = await _schedule_teacher_can_manage(db, ctx, classroom_id)
+        if not can_manage:
+            raise HTTPException(
+                status.HTTP_403_FORBIDDEN,
+                "Apenas administradores ou professor vinculado à turma",
+            )
+
+    return schedules, classroom, macro
+
+
+async def _macro_classroom_students(db: AsyncSession, classroom_id: UUID) -> list[dict[str, Any]]:
+    return await fetch_all(
+        db,
+        """
+        SELECT
+          cs.classroom_id,
+          cs.student_id,
+          p.code,
+          p2.full_name,
+          p2.email,
+          p2.metadata,
+          NULL::uuid AS teacher_id
+        FROM classroom_students cs
+        INNER JOIN profiles p ON p.id = cs.student_id
+        INNER JOIN people p2 ON p2.id = p.person_id
+        WHERE cs.classroom_id = CAST(:cid AS uuid)
+          AND p2.status = 'published'
+        ORDER BY p2.full_name NULLS LAST, cs.student_id
+        """,
+        {"cid": str(classroom_id)},
+    )
+
+
+def _merge_unified_attendance_status(
+    attendance_rows: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Uma linha por aluno: presente se registrado em qualquer caderno da turma."""
+    by_student: dict[str, dict[str, Any]] = {}
+    for row in attendance_rows:
+        sid = str(row["student_id"])
+        bucket = by_student.setdefault(
+            sid,
+            {
+                "student_id": sid,
+                "status": "out",
+                "code": None,
+                "by_schedule": [],
+            },
+        )
+        status = str(row.get("status") or "out")
+        bucket["by_schedule"].append(
+            {
+                "schedule_id": str(row["assessment_schedules_id"]),
+                "attendance_id": row.get("id"),
+                "status": status,
+                "code": row.get("code"),
+            }
+        )
+        if status == "registered":
+            bucket["status"] = "registered"
+        if bucket["code"] is None and row.get("code"):
+            bucket["code"] = row.get("code")
+    return by_student
+
+
+async def _insert_attendance_sheet_row(
+    db: AsyncSession,
+    *,
+    schedule_id: UUID,
+    storage_key: str,
+    safe_name: str,
+    guessed_ct: str,
+    size: int,
+    uploaded_by: UUID,
+) -> dict[str, Any]:
+    row = await fetch_one(
+        db,
+        """
+        INSERT INTO assessment_schedule_attendance_sheet (
+            assessment_schedules_id, storage_key, original_filename, content_type, size_bytes, uploaded_by
+        )
+        VALUES (
+            CAST(:sid AS uuid), :sk, :ofn, :ct, :sz, CAST(:up AS uuid)
+        )
+        RETURNING *
+        """,
+        {
+            "sid": str(schedule_id),
+            "sk": storage_key,
+            "ofn": safe_name,
+            "ct": guessed_ct,
+            "sz": size,
+            "up": str(uploaded_by),
+        },
+    )
+    if row is None:
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Falha ao gravar versão do scan")
+    return row
+
+
+async def _upload_attendance_sheet_to_schedules(
+    db: AsyncSession,
+    ctx: AuthContext,
+    schedules: list[dict[str, Any]],
+    *,
+    data: bytes,
+    guessed_ct: str,
+    safe_name: str,
+) -> dict[str, Any]:
+    storage_key = f"{uuid.uuid4()}.upload"
+    store_attendance_sheet_bytes(storage_key, data)
+    first: dict[str, Any] | None = None
+    for sch in schedules:
+        row = await _insert_attendance_sheet_row(
+            db,
+            schedule_id=sch["id"],
+            storage_key=storage_key,
+            safe_name=safe_name,
+            guessed_ct=guessed_ct,
+            size=len(data),
+            uploaded_by=ctx.active_profile_id,
+        )
+        if first is None:
+            first = row
+    await db.commit()
+    return first or {}
+
+
+async def _list_deduped_attendance_sheet_versions(
+    db: AsyncSession,
+    schedule_ids: list[str],
+) -> list[dict[str, Any]]:
+    if not schedule_ids:
+        return []
+    return await fetch_all(
+        db,
+        """
+        SELECT id, original_filename, content_type, size_bytes, uploaded_by, created_at
+        FROM (
+            SELECT DISTINCT ON (storage_key)
+                id,
+                original_filename,
+                content_type,
+                size_bytes,
+                uploaded_by,
+                created_at,
+                storage_key
+            FROM assessment_schedule_attendance_sheet
+            WHERE assessment_schedules_id = ANY(CAST(:sids AS uuid[]))
+            ORDER BY storage_key, created_at DESC
+        ) q
+        ORDER BY created_at DESC
+        """,
+        {"sids": schedule_ids},
+    )
+
+
+@router.get("/macro-assessments/{macro_id}/classrooms/{classroom_id}/attendance-roster")
+async def get_macro_classroom_attendance_roster_v1(
+    macro_id: UUID,
+    classroom_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+):
+    """Lista unificada de presença: macro + turma, propagando vários cadernos/agendamentos."""
+    schedules, classroom, macro = await _resolve_macro_classroom_schedules(
+        db,
+        ctx,
+        macro_assessment_id=macro_id,
+        classroom_id=classroom_id,
+        academic_year_id=academic_year_id,
+    )
+    schedule_ids = [str(s["id"]) for s in schedules]
+    students = await _macro_classroom_students(db, classroom_id)
+    attendance_rows = await fetch_all(
+        db,
+        """
+        SELECT
+          aal.*,
+          p2.full_name AS student_full_name,
+          p2.email AS student_email
+        FROM assessment_attendance_list aal
+        LEFT JOIN profiles p ON p.id = aal.student_id
+        LEFT JOIN people p2 ON p2.id = p.person_id
+        WHERE aal.assessment_schedules_id = ANY(CAST(:sids AS uuid[]))
+        ORDER BY aal.id ASC
+        """,
+        {"sids": schedule_ids},
+    )
+    merged = _merge_unified_attendance_status(attendance_rows)
+    cadernos = [
+        {
+            "schedule_id": str(s["id"]),
+            "assessment_id": str(s["assessment_id"]),
+            "title": s.get("_assessment_title"),
+            "start_time": s.get("start_time"),
+            "end_time": s.get("end_time"),
+        }
+        for s in schedules
+    ]
+    attendance = []
+    for student in students:
+        sid = str(student["student_id"])
+        bucket = merged.get(sid)
+        attendance.append(
+            {
+                "student_id": sid,
+                "student_full_name": student.get("full_name"),
+                "status": bucket["status"] if bucket else "out",
+                "code": bucket["code"] if bucket else None,
+                "by_schedule": bucket["by_schedule"] if bucket else [],
+            }
+        )
+
+    ay = classroom.get("academic_year_id")
+    return {
+        "macro_assessment": {"id": str(macro["id"]), "title": macro.get("title")},
+        "classroom": classroom,
+        "cadernos": cadernos,
+        "schedule_ids": schedule_ids,
+        "students": students,
+        "attendance": attendance,
+        **({"academic_year_id": str(ay)} if ay is not None else {}),
+    }
+
+
+@router.patch("/macro-assessments/{macro_id}/classrooms/{classroom_id}/attendance/bulk")
+async def patch_macro_classroom_attendance_bulk_v1(
+    macro_id: UUID,
+    classroom_id: UUID,
+    body: AttendanceBulkPatchBody,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+):
+    """Grava presença unificada replicando o status em todos os agendamentos da macro na turma."""
+    schedules, _classroom, _macro = await _resolve_macro_classroom_schedules(
+        db,
+        ctx,
+        macro_assessment_id=macro_id,
+        classroom_id=classroom_id,
+        academic_year_id=academic_year_id,
+    )
+    await _assert_schedule_attendance_editor(db, ctx, {"classroom_id": classroom_id})
+    total = 0
+    for sch in schedules:
+        rows = await _apply_attendance_upserts(db, sch["id"], body.items)
+        total += len(rows)
+    await db.commit()
+    return {"count": total, "schedules_updated": len(schedules)}
+
+
+@router.get("/macro-assessments/{macro_id}/classrooms/{classroom_id}/attendance-sheet/pdf")
+async def download_macro_classroom_attendance_sheet_pdf_v1(
+    macro_id: UUID,
+    classroom_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+):
+    """PDF único da lista de presença (macro + turma)."""
+    schedules, classroom, macro = await _resolve_macro_classroom_schedules(
+        db,
+        ctx,
+        macro_assessment_id=macro_id,
+        classroom_id=classroom_id,
+        academic_year_id=academic_year_id,
+    )
+    await _assert_schedule_attendance_editor(db, ctx, {"classroom_id": classroom_id})
+    students = await _macro_classroom_students(db, classroom_id)
+    caderno_titles = [
+        str(s.get("_assessment_title") or "").strip()
+        for s in schedules
+        if str(s.get("_assessment_title") or "").strip()
+    ]
+    subtitle = f"Cadernos: {', '.join(caderno_titles)}" if caderno_titles else None
+    assessment_title = str(macro.get("title") or "Macro avaliação")
+    if subtitle:
+        assessment_title = f"{assessment_title} — {subtitle}"
+
+    school_row = await fetch_one(
+        db,
+        """
+        SELECT s.name AS school_name, s.id AS school_id
+        FROM schools s
+        JOIN classrooms c ON c.school_id = s.id
+        WHERE c.id = CAST(:cid AS uuid)
+        LIMIT 1
+        """,
+        {"cid": str(classroom_id)},
+    )
+    if not school_row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Escola da turma não encontrada")
+
+    ay_label: str | None = None
+    ay_id = classroom.get("academic_year_id")
+    if ay_id:
+        ay = await fetch_one(
+            db,
+            "SELECT year FROM academic_years WHERE id = CAST(:id AS uuid)",
+            {"id": str(ay_id)},
+        )
+        if ay and ay.get("year") is not None:
+            ay_label = str(ay["year"])
+
+    starts = [s.get("start_time") for s in schedules if s.get("start_time")]
+    ends = [s.get("end_time") for s in schedules if s.get("end_time")]
+    schedule_start = min(starts) if starts else None
+    schedule_end = max(ends) if ends else None
+
+    pdf_bytes = build_attendance_sheet_pdf_bytes(
+        school_name=str(school_row.get("school_name") or "—"),
+        classroom_name=str(classroom.get("name") or "—"),
+        classroom_code=(str(classroom["code"]) if classroom.get("code") else None),
+        assessment_title=assessment_title,
+        schedule_start=schedule_start,
+        schedule_end=schedule_end,
+        academic_year_label=ay_label,
+        school_id=(str(school_row["school_id"]) if school_row.get("school_id") else None),
+        classroom_id=str(classroom_id),
+        assessment_id=str(macro_id),
+        students=students,
+    )
+    base = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(macro_id))[:24]
+    fname = f"lista-presenca-macro-{base}-turma-{classroom_id}.pdf"
+    return Response(
+        content=pdf_bytes,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f'attachment; filename="{fname}"'},
+    )
+
+
+@router.get("/macro-assessments/{macro_id}/classrooms/{classroom_id}/answer-cards-combined-pdf")
+async def download_macro_classroom_answer_cards_pdf_v1(
+    macro_id: UUID,
+    classroom_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(
+        None,
+        description="Ano letivo. Se omitido, usa is_primary=true.",
+    ),
+):
+    """PDF combinado de cartões-resposta de todos os cadernos da macro na turma."""
+    schedules, _classroom, _macro = await _resolve_macro_classroom_schedules(
+        db,
+        ctx,
+        macro_assessment_id=macro_id,
+        classroom_id=classroom_id,
+        academic_year_id=academic_year_id,
+    )
+    schedule_ids = [str(s["id"]) for s in schedules]
+    try:
+        rows = await fetch_all(
+            db,
+            """
+            SELECT
+              agendamento,
+              caderno,
+              ano_serie,
+              turma,
+              estudante,
+              ra_codigo,
+              codigo_cartao,
+              escola,
+              qr_code_text,
+              titulo,
+              logo_url,
+              output
+            FROM vw_student_assessment
+            WHERE agendamento = ANY(CAST(:sids AS uuid[]))
+            ORDER BY caderno NULLS LAST, estudante NULLS LAST, codigo_cartao
+            """,
+            {"sids": schedule_ids},
+        )
+    except ProgrammingError as e:
+        log.exception(
+            "macro answer-cards-combined-pdf: view inválida macro=%s classroom=%s",
+            macro_id,
+            classroom_id,
+        )
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            "View vw_student_assessment indisponível ou colunas desatualizadas.",
+        ) from e
+    if not rows:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Nenhum cartão-resposta (confira a presença ou a view vw_student_assessment).",
+        )
+    parts: list[bytes] = []
+    try:
+        for r in rows:
+            parts.append(build_cartao_resposta_pdf_bytes_from_view_row(dict(r)))
+        pdf = merge_pdf_bytes(parts)
+    except Exception as e:  # noqa: BLE001
+        log.exception(
+            "macro answer-cards-combined-pdf: falha macro=%s classroom=%s",
+            macro_id,
+            classroom_id,
+        )
+        raise HTTPException(
+            status.HTTP_500_INTERNAL_SERVER_ERROR,
+            "Falha ao gerar o PDF combinado dos cartões.",
+        ) from e
+    base = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(macro_id))[:24]
+    filename = f"cartoes-resposta-macro-{base}-turma-{classroom_id}.pdf"
+    cd = f"attachment; filename=\"{filename}\"; filename*=UTF-8''{quote(filename)}"
+    return Response(content=pdf, media_type="application/pdf", headers={"Content-Disposition": cd})
+
+
+@router.post("/macro-assessments/{macro_id}/classrooms/{classroom_id}/attendance-sheet/upload")
+async def upload_macro_classroom_attendance_sheet_v1(
+    macro_id: UUID,
+    classroom_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    file: UploadFile = File(...),
+    academic_year_id: UUID | None = Query(
+        None,
+        description="Ano letivo. Se omitido, usa is_primary=true.",
+    ),
+):
+    """Upload único de scan; registra a mesma versão em todos os agendamentos da macro na turma."""
+    schedules, _classroom, _macro = await _resolve_macro_classroom_schedules(
+        db,
+        ctx,
+        macro_assessment_id=macro_id,
+        classroom_id=classroom_id,
+        academic_year_id=academic_year_id,
+    )
+    await _assert_schedule_attendance_editor(db, ctx, {"classroom_id": classroom_id})
+    raw_ct = (file.content_type or "").split(";")[0].strip().lower()
+    data = await file.read()
+    guessed_ct = _guess_sheet_content_type(raw_ct, file.filename, data)
+    if guessed_ct not in _ALLOWED_ATTENDANCE_SHEET_MEDIA:
+        raise HTTPException(
+            status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+            "Tipo de ficheiro não permitido (use PDF ou imagem JPEG/PNG/WebP).",
+        )
+    if len(data) > settings.attendance_sheet_max_bytes:
+        raise HTTPException(status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, "Ficheiro demasiado grande")
+    safe_name = (file.filename or "lista-presenca").replace("..", "_").strip()[:255] or "lista-presenca"
+    try:
+        return await _upload_attendance_sheet_to_schedules(
+            db,
+            ctx,
+            schedules,
+            data=data,
+            guessed_ct=guessed_ct,
+            safe_name=safe_name,
+        )
+    except Exception as exc:
+        if _looks_like_attendance_sheet_table_missing(exc):
+            raise HTTPException(
+                status.HTTP_503_SERVICE_UNAVAILABLE,
+                "Recurso de lista de presença ainda não está disponível neste ambiente (migração pendente).",
+            )
+        raise
+
+
+@router.get("/macro-assessments/{macro_id}/classrooms/{classroom_id}/attendance-sheet/versions")
+async def list_macro_classroom_attendance_sheet_versions_v1(
+    macro_id: UUID,
+    classroom_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+):
+    """Histórico de scans unificados (deduplicado por ficheiro)."""
+    schedules, _classroom, _macro = await _resolve_macro_classroom_schedules(
+        db,
+        ctx,
+        macro_assessment_id=macro_id,
+        classroom_id=classroom_id,
+        academic_year_id=academic_year_id,
+    )
+    await _assert_schedule_attendance_editor(db, ctx, {"classroom_id": classroom_id})
+    schedule_ids = [str(s["id"]) for s in schedules]
+    try:
+        return await _list_deduped_attendance_sheet_versions(db, schedule_ids)
+    except Exception as exc:
+        if _looks_like_attendance_sheet_table_missing(exc):
+            return []
+        raise
+
+
+@router.get("/macro-assessments/{macro_id}/classrooms/{classroom_id}/attendance-sheet/file")
+async def download_macro_classroom_attendance_sheet_file_v1(
+    macro_id: UUID,
+    classroom_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    attendance_sheet_id: int | None = Query(
+        None,
+        description="ID da versão. Omitido = última versão unificada.",
+    ),
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+):
+    schedules, _classroom, _macro = await _resolve_macro_classroom_schedules(
+        db,
+        ctx,
+        macro_assessment_id=macro_id,
+        classroom_id=classroom_id,
+        academic_year_id=academic_year_id,
+    )
+    await _assert_schedule_attendance_editor(db, ctx, {"classroom_id": classroom_id})
+    schedule_ids = [str(s["id"]) for s in schedules]
+    try:
+        if attendance_sheet_id is not None:
+            row = await fetch_one(
+                db,
+                """
+                SELECT * FROM assessment_schedule_attendance_sheet
+                WHERE id = :aid
+                  AND assessment_schedules_id = ANY(CAST(:sids AS uuid[]))
+                LIMIT 1
+                """,
+                {"aid": attendance_sheet_id, "sids": schedule_ids},
+            )
+        else:
+            row = await fetch_one(
+                db,
+                """
+                SELECT DISTINCT ON (storage_key) *
+                FROM assessment_schedule_attendance_sheet
+                WHERE assessment_schedules_id = ANY(CAST(:sids AS uuid[]))
+                ORDER BY storage_key, created_at DESC
+                LIMIT 1
+                """,
+                {"sids": schedule_ids},
+            )
+            if row is None:
+                rows = await _list_deduped_attendance_sheet_versions(db, schedule_ids)
+                if rows:
+                    row = await fetch_one(
+                        db,
+                        "SELECT * FROM assessment_schedule_attendance_sheet WHERE id = :aid LIMIT 1",
+                        {"aid": rows[0]["id"]},
+                    )
+    except Exception as exc:
+        if _looks_like_attendance_sheet_table_missing(exc):
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Nenhum scan disponível")
+        raise
+    if not row:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Nenhum ficheiro de lista de presença para esta macro/turma.",
+        )
+    sk = row.get("storage_key")
+    if not sk:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Metadados de armazenamento inválidos.")
+    try:
+        body = load_attendance_sheet_bytes(str(sk))
+    except FileNotFoundError:
+        raise HTTPException(
+            status.HTTP_404_NOT_FOUND,
+            "Ficheiro não encontrado no armazenamento.",
+        )
+    ct = row.get("content_type") or "application/octet-stream"
+    ofn = row.get("original_filename")
+    fname = _attendance_sheet_attachment_filename(str(ofn) if ofn is not None else None)
+    return Response(
+        content=body,
+        media_type=str(ct),
         headers={"Content-Disposition": f'attachment; filename="{fname}"'},
     )
 
