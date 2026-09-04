@@ -1,7 +1,7 @@
 import hashlib
 import secrets
 from datetime import datetime, timedelta, timezone
-from typing import Any
+from typing import Any, Literal
 from uuid import UUID
 
 import jwt
@@ -67,6 +67,84 @@ def decode_bootstrap_token(token: str) -> UUID:
     if payload.get("typ") != "bootstrap":
         raise ValueError("Invalid bootstrap token type")
     return UUID(payload["sub"])
+
+
+DiscoveryMethod = Literal["password", "google", "microsoft"]
+
+
+def _discovery_exp() -> tuple[int, int]:
+    now = _utcnow()
+    exp = now + timedelta(minutes=settings.discovery_challenge_ttl_minutes)
+    return int(now.timestamp()), int(exp.timestamp())
+
+
+def create_discovery_challenge_token(
+    *,
+    email_hash: str,
+    method: DiscoveryMethod,
+    person_id: UUID | None = None,
+    school_id: UUID | None = None,
+    decoy: bool = False,
+) -> str:
+    """JWT opaco de curta duração para vincular e-mail normalizado ao método encontrado."""
+    iat, exp = _discovery_exp()
+    jti = secrets.token_urlsafe(16)
+    claims: dict[str, Any] = {
+        "typ": "discovery",
+        "sub": email_hash,
+        "meth": method,
+        "jti": jti,
+        "iat": iat,
+        "exp": exp,
+    }
+    if person_id:
+        claims["pid"] = str(person_id)
+    if school_id:
+        claims["sch"] = str(school_id)
+    if decoy:
+        claims["dec"] = True
+    return jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def create_discovery_choose_token(*, email_hash: str, person_id: UUID) -> str:
+    iat, exp = _discovery_exp()
+    jti = secrets.token_urlsafe(16)
+    claims: dict[str, Any] = {
+        "typ": "discovery_choose",
+        "sub": email_hash,
+        "pid": str(person_id),
+        "jti": jti,
+        "iat": iat,
+        "exp": exp,
+    }
+    return jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def create_discovery_choice_token(
+    *,
+    parent_jti: str,
+    email_hash: str,
+    person_id: UUID,
+    school_id: UUID,
+    method: DiscoveryMethod,
+) -> str:
+    iat, exp = _discovery_exp()
+    claims: dict[str, Any] = {
+        "typ": "discovery_choice",
+        "par": parent_jti,
+        "sub": email_hash,
+        "pid": str(person_id),
+        "sch": str(school_id),
+        "meth": method,
+        "jti": secrets.token_urlsafe(16),
+        "iat": iat,
+        "exp": exp,
+    }
+    return jwt.encode(claims, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+
+
+def decode_discovery_token(token: str) -> dict[str, Any]:
+    return jwt.decode(token.strip(), settings.jwt_secret, algorithms=[settings.jwt_algorithm])
 
 
 def session_expires_at() -> datetime:

@@ -5,7 +5,13 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import AuthContext, get_auth_context_optional, parse_forwarded_for
 from app.db.session import get_db
+from app.domains.auth.discovery import confirm_institution_choice, discover_auth_method
 from app.domains.auth.service import logout_session
+from app.v1.auth.discovery_schemas import (
+    DiscoveryChooseRequestV1,
+    DiscoveryRequestV1,
+    DiscoveryResponseV1,
+)
 from app.v1.auth.schemas import (
     FirebaseExchangeRequestV1,
     FirebaseExchangeResponseV1,
@@ -24,6 +30,45 @@ from app.v1.auth.service import (
 )
 
 router = APIRouter()
+
+
+@router.post(
+    "/discovery",
+    response_model=DiscoveryResponseV1,
+    summary="Descobrir método de autenticação",
+    description=(
+        "Etapa 1 do login em duas etapas. Informe o e-mail institucional; "
+        "a resposta indica o método configurado para a escola (password, google ou microsoft) "
+        "ou solicita escolha de instituição quando há vínculos com métodos diferentes."
+    ),
+)
+async def post_auth_discovery_v1(
+    body: DiscoveryRequestV1,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    x_forwarded_for: Annotated[str | None, Header(alias="X-Forwarded-For")] = None,
+):
+    ip = parse_forwarded_for(x_forwarded_for) or (request.client.host if request.client else None)
+    result = await discover_auth_method(db, email=body.email, ip=ip)
+    return DiscoveryResponseV1(**result)
+
+
+@router.post(
+    "/discovery/choose",
+    response_model=DiscoveryResponseV1,
+    summary="Confirmar instituição (múltiplos vínculos)",
+)
+async def post_auth_discovery_choose_v1(
+    body: DiscoveryChooseRequestV1,
+    request: Request,
+    db: Annotated[AsyncSession, Depends(get_db)],
+    x_forwarded_for: Annotated[str | None, Header(alias="X-Forwarded-For")] = None,
+):
+    ip = parse_forwarded_for(x_forwarded_for) or (request.client.host if request.client else None)
+    result = await confirm_institution_choice(
+        db, challenge_id=body.challenge_id, choice_id=body.choice_id, ip=ip
+    )
+    return DiscoveryResponseV1(**result)
 
 
 @router.post(

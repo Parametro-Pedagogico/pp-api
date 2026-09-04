@@ -117,16 +117,22 @@ check: lint typecheck test ## Lint + typecheck + testes
 # ----------------------------------------------------------------------------
 # Database
 # ----------------------------------------------------------------------------
-.PHONY: db-migrate db-psql
-db-migrate: ## Aplica migrations SQL usando DATABASE_URL
+.PHONY: db-migrate db-migrate-one db-psql
+MIGRATION_SCRIPT ?= ../pp-spec/99_migration/apply_migration.py
+MIGRATION_ENV ?= ../pp-spec/99_migration/.env.migration
+
+db-migrate: ## Aplica todas as migrations SQL via script Python (.env.migration)
 	@command -v psql >/dev/null || { echo "psql não encontrado"; exit 1; }
-	@url="$${DATABASE_URL_PSQL:-$$DATABASE_URL}"; \
-	url="$$(echo "$$url" | sed 's#postgresql+asyncpg://#postgresql://#')"; \
-	[ -n "$$url" ] || { echo "Defina DATABASE_URL no .env"; exit 1; }; \
-	for f in $$(ls $(MIGRATIONS_DIR)/*.sql | sort); do \
-		echo "==> aplicando $$f"; \
-		psql "$$url" -v ON_ERROR_STOP=1 -f "$$f" || exit 1; \
-	done
+	@command -v python3 >/dev/null || { echo "python3 não encontrado"; exit 1; }
+	@[ -f $(MIGRATION_ENV) ] || { echo "Defina $(MIGRATION_ENV) com DATABASE_DESTINATION"; exit 1; }
+	python3 $(MIGRATION_SCRIPT) --all --yes --env-file $(MIGRATION_ENV)
+
+db-migrate-one: ## Aplica uma migration: make db-migrate-one MIGRATION=028
+	@command -v psql >/dev/null || { echo "psql não encontrado"; exit 1; }
+	@command -v python3 >/dev/null || { echo "python3 não encontrado"; exit 1; }
+	@[ -f $(MIGRATION_ENV) ] || { echo "Defina $(MIGRATION_ENV) com DATABASE_DESTINATION"; exit 1; }
+	@[ -n "$(MIGRATION)" ] || { echo "Use: make db-migrate-one MIGRATION=028"; exit 1; }
+	python3 $(MIGRATION_SCRIPT) $(MIGRATION) --yes --env-file $(MIGRATION_ENV)
 
 db-psql: ## Abre psql usando DATABASE_URL
 	@url="$${DATABASE_URL_PSQL:-$$DATABASE_URL}"; \

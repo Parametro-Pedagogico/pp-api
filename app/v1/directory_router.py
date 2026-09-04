@@ -192,6 +192,7 @@ class UserCreateBody(BaseModel):
     full_name: str
     email: str
     role: str | None = None
+    role_definition_id: UUID | None = None
     school_id: UUID | None = None
     code: str | None = None
     phone: str | None = None
@@ -211,6 +212,7 @@ class UserPatchBody(BaseModel):
     birthdate: str | None = None
     metadata: str | None = None
     role: str | None = None
+    role_definition_id: UUID | None = None
     school_id: UUID | None = None
     neurotypical: bool | None = None
     neurotypical_description: str | None = None
@@ -221,8 +223,15 @@ async def _create_user_with_profile(
     *,
     body: UserCreateBody,
 ) -> dict:
-    if not body.role:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "role é obrigatório")
+    from app.domains.rbac.profile_role_service import resolve_profile_role_assignment
+
+    if not body.role and not body.role_definition_id:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "role ou role_definition_id é obrigatório")
+    enum_role, role_definition_id = await resolve_profile_role_assignment(
+        db,
+        role_definition_id=body.role_definition_id,
+        legacy_role=body.role,
+    )
     profile_code = (body.code or "").strip() or None
     auth_provider = "firebase" if body.create_firebase_user else "database"
     can_login = body.create_firebase_user
@@ -253,7 +262,7 @@ async def _create_user_with_profile(
     assert people_row is not None
     person_id = people_row["id"]
 
-    if _role_is_student(body.role) and (
+    if _role_is_student(enum_role) and (
         body.neurotypical is not None or body.neurotypical_description is not None
     ):
         neuro_sets: list[str] = []
@@ -294,12 +303,20 @@ async def _create_user_with_profile(
     profile_row = await fetch_one(
         db,
         """
-        INSERT INTO profiles (id, role, school_id, code, person_id)
-        VALUES (gen_random_uuid(), CAST(:role AS user_role), CAST(:school_id AS uuid), :code, CAST(:person_id AS uuid))
+        INSERT INTO profiles (id, role, role_definition_id, school_id, code, person_id)
+        VALUES (
+            gen_random_uuid(),
+            CAST(:role AS user_role),
+            CAST(:role_definition_id AS uuid),
+            CAST(:school_id AS uuid),
+            :code,
+            CAST(:person_id AS uuid)
+        )
         RETURNING id
         """,
         {
-            "role": body.role,
+            "role": enum_role,
+            "role_definition_id": str(role_definition_id) if role_definition_id else None,
             "school_id": str(body.school_id) if body.school_id else None,
             "code": profile_code,
             "person_id": str(person_id),
@@ -460,9 +477,20 @@ async def patch_user_v1(
         )
     sets_profile = []
     pr_params: dict[str, Any] = {"id": str(user_id)}
-    if body.role is not None:
+    if body.role is not None or body.role_definition_id is not None:
+        from app.domains.rbac.profile_role_service import resolve_profile_role_assignment
+
+        enum_role, role_definition_id = await resolve_profile_role_assignment(
+            db,
+            role_definition_id=body.role_definition_id,
+            legacy_role=body.role,
+        )
         sets_profile.append("role = CAST(:role AS user_role)")
-        pr_params["role"] = body.role
+        pr_params["role"] = enum_role
+        sets_profile.append("role_definition_id = CAST(:role_definition_id AS uuid)")
+        pr_params["role_definition_id"] = (
+            str(role_definition_id) if role_definition_id else None
+        )
     if body.school_id is not None:
         sets_profile.append("school_id = CAST(:school_id AS uuid)")
         pr_params["school_id"] = str(body.school_id)

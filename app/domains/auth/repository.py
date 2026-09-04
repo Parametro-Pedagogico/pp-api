@@ -83,7 +83,13 @@ async def update_person_firebase_link(
 async def list_profiles_for_person(db: AsyncSession, person_id: UUID) -> list[dict]:
     q = text(
         """
-        SELECT id, full_name, email, role, school_id, person_id, code, metadata
+        SELECT id, full_name, email,
+               effective_role AS role,
+               role AS legacy_role,
+               role_definition_id,
+               role_definition_code,
+               role_definition_name,
+               school_id, person_id, code, metadata
         FROM vw_profiles
         WHERE person_id = :pid
         ORDER BY created_at NULLS LAST
@@ -96,7 +102,13 @@ async def list_profiles_for_person(db: AsyncSession, person_id: UUID) -> list[di
 async def get_profile_for_person(db: AsyncSession, person_id: UUID, profile_id: UUID) -> dict | None:
     q = text(
         """
-        SELECT id, full_name, email, role, school_id, person_id, code, metadata
+        SELECT id, full_name, email,
+               effective_role AS role,
+               role AS legacy_role,
+               role_definition_id,
+               role_definition_code,
+               role_definition_name,
+               school_id, person_id, code, metadata
         FROM vw_profiles
         WHERE person_id = :pid AND id = :prid
         LIMIT 1
@@ -132,7 +144,13 @@ async def update_person_metadata(db: AsyncSession, person_id: UUID, metadata: st
 async def get_profile_row_by_id(db: AsyncSession, profile_id: UUID) -> dict | None:
     q = text(
         """
-        SELECT id, full_name, email, role, school_id, person_id, code, metadata
+        SELECT id, full_name, email,
+               effective_role AS role,
+               role AS legacy_role,
+               role_definition_id,
+               role_definition_code,
+               role_definition_name,
+               school_id, person_id, code, metadata
         FROM vw_profiles
         WHERE id = :id
         LIMIT 1

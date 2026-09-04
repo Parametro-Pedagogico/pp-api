@@ -25,6 +25,11 @@ from app.v1._scope import (
     is_admin_like,
     is_staff_admin_role,
 )
+from app.domains.rbac.module_access_service import (
+    ACCESS_RANK,
+    assert_module_access,
+    get_module_access_level,
+)
 from app.v1._sql import execute, fetch_all, fetch_one
 from app.v1.cartao_resposta_pdf import (
     build_cartao_resposta_pdf_bytes_from_view_row,
@@ -37,6 +42,59 @@ from app.core.config import settings
 
 router = APIRouter(tags=["v1-assessments"])
 log = logging.getLogger(__name__)
+
+ASSESSMENTS_MODULE = "admin.assessments"
+SCHEDULES_MODULE = "admin.schedules"
+
+
+async def _has_platform_module_access(
+    db: AsyncSession,
+    ctx: AuthContext,
+    module_code: str,
+    min_level: str,
+) -> bool:
+    if is_admin_like(ctx.role):
+        return True
+    level = await get_module_access_level(db, ctx, module_code)
+    required = ACCESS_RANK.get(min_level.upper(), 0)
+    current = ACCESS_RANK.get(str(level).upper(), 0)
+    return current >= required
+
+
+async def _assert_assessments_view(db: AsyncSession, ctx: AuthContext) -> None:
+    if is_admin_like(ctx.role):
+        return
+    await assert_module_access(db, ctx, ASSESSMENTS_MODULE, "VIEW")
+
+
+async def _assert_assessments_edit(db: AsyncSession, ctx: AuthContext) -> None:
+    if is_admin_like(ctx.role):
+        return
+    await assert_module_access(db, ctx, ASSESSMENTS_MODULE, "EDIT")
+
+
+async def _assert_assessments_manage(db: AsyncSession, ctx: AuthContext) -> None:
+    if is_admin_like(ctx.role):
+        return
+    await assert_module_access(db, ctx, ASSESSMENTS_MODULE, "MANAGE")
+
+
+async def _assert_schedules_view(db: AsyncSession, ctx: AuthContext) -> None:
+    if is_admin_like(ctx.role):
+        return
+    await assert_module_access(db, ctx, SCHEDULES_MODULE, "VIEW")
+
+
+async def _assert_schedules_edit(db: AsyncSession, ctx: AuthContext) -> None:
+    if is_admin_like(ctx.role):
+        return
+    await assert_module_access(db, ctx, SCHEDULES_MODULE, "EDIT")
+
+
+async def _assert_schedules_manage(db: AsyncSession, ctx: AuthContext) -> None:
+    if is_admin_like(ctx.role):
+        return
+    await assert_module_access(db, ctx, SCHEDULES_MODULE, "MANAGE")
 
 _ALLOWED_ATTENDANCE_SHEET_MEDIA = frozenset(
     {
@@ -156,6 +214,7 @@ async def list_assessments_v1(
 ):
     effective_ay = await resolve_academic_year_id(db, academic_year_id)
     sscope = await get_effective_school_scope(db, ctx)
+    platform_catalog = await _has_platform_module_access(db, ctx, ASSESSMENTS_MODULE, "VIEW")
     sql = "SELECT * FROM assessments WHERE 1=1"
     params: dict[str, Any] = {}
     sql += """
@@ -178,7 +237,7 @@ async def list_assessments_v1(
             subtree = await get_descendant_school_ids(db, school_id)
             sql += " AND school_id = ANY(CAST(:school_subtree AS uuid[]))"
             params["school_subtree"] = [str(x) for x in subtree]
-    elif not sscope["is_admin_like"]:
+    elif not sscope["is_admin_like"] and not platform_catalog:
         sql += " AND school_id = ANY(CAST(:sids AS uuid[]))"
         params["sids"] = [str(x) for x in (sscope["effective_school_ids"] or [])]
     count_row = await fetch_one(db, f"SELECT COUNT(*)::int AS total FROM ({sql}) q", params)
@@ -197,8 +256,12 @@ async def create_assessment_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     sscope = await get_effective_school_scope(db, ctx)
-    if not sscope["is_admin_like"] and str(body.school_id) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Escola fora do escopo")
+    if not sscope["is_admin_like"]:
+        if not await _has_platform_module_access(db, ctx, ASSESSMENTS_MODULE, "MANAGE"):
+            if str(body.school_id) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
+                raise HTTPException(status.HTTP_403_FORBIDDEN, "Escola fora do escopo")
+        else:
+            await _assert_assessments_manage(db, ctx)
     row = await fetch_one(
         db,
         """
@@ -232,8 +295,10 @@ async def get_assessment_v1(
     )
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Assessment not found")
-    if not sscope["is_admin_like"] and str(row["school_id"]) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
+    if not sscope["is_admin_like"]:
+        in_scope = str(row["school_id"]) in {str(x) for x in (sscope["effective_school_ids"] or [])}
+        if not in_scope and not await _has_platform_module_access(db, ctx, ASSESSMENTS_MODULE, "VIEW"):
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
     return row
 
 
@@ -245,6 +310,8 @@ async def patch_assessment_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     await get_assessment_v1(assessment_id, ctx, db)
+    if not is_admin_like(ctx.role):
+        await _assert_assessments_edit(db, ctx)
     sets = []
     params: dict[str, Any] = {"id": str(assessment_id)}
     if body.title is not None:
@@ -274,7 +341,11 @@ async def delete_assessment_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     await get_assessment_v1(assessment_id, ctx, db)
-    if not is_admin_like(ctx.role):
+    if is_admin_like(ctx.role):
+        pass
+    elif await _has_platform_module_access(db, ctx, ASSESSMENTS_MODULE, "MANAGE"):
+        await _assert_assessments_manage(db, ctx)
+    else:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
     await execute(db, "DELETE FROM assessments WHERE id = CAST(:id AS uuid)", {"id": str(assessment_id)})
     await db.commit()
@@ -2246,9 +2317,22 @@ class MacroAssessmentPatch(BaseModel):
     end_date: datetime | None = None
 
 
-def _assert_platform_catalog_admin(ctx: AuthContext) -> None:
-    if not is_admin_like(ctx.role):
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores da plataforma")
+async def _assert_macro_assessments_view(db: AsyncSession, ctx: AuthContext) -> None:
+    if is_admin_like(ctx.role):
+        return
+    await assert_module_access(db, ctx, ASSESSMENTS_MODULE, "VIEW")
+
+
+async def _assert_macro_assessments_edit(db: AsyncSession, ctx: AuthContext) -> None:
+    if is_admin_like(ctx.role):
+        return
+    await assert_module_access(db, ctx, ASSESSMENTS_MODULE, "EDIT")
+
+
+async def _assert_macro_assessments_manage(db: AsyncSession, ctx: AuthContext) -> None:
+    if is_admin_like(ctx.role):
+        return
+    await assert_module_access(db, ctx, ASSESSMENTS_MODULE, "MANAGE")
 
 
 @router.get("/macro-assessments")
@@ -2258,7 +2342,7 @@ async def list_macro_assessments_admin_v1(
     pg: Annotated[PageArgs, Depends(pagination_params)] = PageArgs(1, 50),
 ):
     """Lista macro avaliações para gestão administrativa."""
-    _assert_platform_catalog_admin(ctx)
+    await _assert_macro_assessments_view(db, ctx)
     count_row = await fetch_one(db, "SELECT COUNT(*)::int AS total FROM macro_assessments", {})
     items = await fetch_all(
         db,
@@ -2280,7 +2364,7 @@ async def create_macro_assessment_admin_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_catalog_admin(ctx)
+    await _assert_macro_assessments_manage(db, ctx)
     row = await fetch_one(
         db,
         """
@@ -2305,7 +2389,7 @@ async def get_macro_assessment_admin_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_catalog_admin(ctx)
+    await _assert_macro_assessments_view(db, ctx)
     row = await fetch_one(
         db,
         "SELECT * FROM macro_assessments WHERE id = CAST(:id AS uuid)",
@@ -2333,7 +2417,7 @@ async def patch_macro_assessment_admin_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_catalog_admin(ctx)
+    await _assert_macro_assessments_edit(db, ctx)
     row = await fetch_one(
         db,
         "SELECT id FROM macro_assessments WHERE id = CAST(:id AS uuid)",
@@ -2369,7 +2453,7 @@ async def delete_macro_assessment_admin_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_catalog_admin(ctx)
+    await _assert_macro_assessments_manage(db, ctx)
     linked = await fetch_one(
         db,
         "SELECT id FROM assessments WHERE macro_assessment_id = CAST(:id AS uuid) LIMIT 1",

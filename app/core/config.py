@@ -37,6 +37,9 @@ class Settings(BaseSettings):
     jwt_algorithm: str = "HS256"
     access_token_ttl_minutes: int = 15
     bootstrap_token_ttl_minutes: int = 10
+    discovery_challenge_ttl_minutes: int = 5
+    discovery_rate_limit_per_ip: int = 30
+    discovery_rate_limit_window_seconds: int = 300
     refresh_token_ttl_days: int = 30
 
     refresh_token_pepper: str = Field(..., min_length=16)

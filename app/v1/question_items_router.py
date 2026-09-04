@@ -17,8 +17,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from app.core.deps import AuthContext, get_auth_context
 from app.db.session import get_db
 from app.v1._paging import PageArgs, paged_response, pagination_params
-from app.v1._scope import is_admin_like
 from app.v1._sql import execute, fetch_all, fetch_one
+from app.domains.rbac.module_access_service import assert_module_access
 from app.v1.question_difficulty import (
     UNCALCULATED_DIFFICULTY_FILTER,
     difficulty_level_label,
@@ -32,6 +32,8 @@ from app.v1.question_types import (
 )
 
 router = APIRouter(prefix="/question-items", tags=["v1-question-items"])
+
+QUESTIONS_MODULE_CODE = "admin.questions"
 
 PP_SOURCE_NAME = "PP"
 
@@ -70,12 +72,16 @@ def html_to_plain(value: str | None) -> str | None:
     return extractor.get_text()
 
 
-def _assert_platform_admin(ctx: AuthContext) -> None:
-    if not is_admin_like(ctx.role):
-        raise HTTPException(
-            status.HTTP_403_FORBIDDEN,
-            "Apenas administradores da plataforma",
-        )
+async def _assert_questions_view(ctx: AuthContext, db: AsyncSession) -> None:
+    await assert_module_access(db, ctx, QUESTIONS_MODULE_CODE, "VIEW")
+
+
+async def _assert_questions_edit(ctx: AuthContext, db: AsyncSession) -> None:
+    await assert_module_access(db, ctx, QUESTIONS_MODULE_CODE, "EDIT")
+
+
+async def _assert_questions_manage(ctx: AuthContext, db: AsyncSession) -> None:
+    await assert_module_access(db, ctx, QUESTIONS_MODULE_CODE, "MANAGE")
 
 
 def _iso(value: Any) -> str | None:
@@ -434,7 +440,7 @@ async def list_question_sources_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_view(ctx, db)
     rows = await fetch_all(
         db,
         """
@@ -460,7 +466,7 @@ async def list_question_sources_v1(
 async def list_question_types_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_view(ctx, db)
     return {"items": list_question_types_meta()}
 
 
@@ -469,7 +475,7 @@ async def list_curricular_areas_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_view(ctx, db)
     rows = await fetch_all(
         db,
         "SELECT slug, name FROM curricular_areas ORDER BY name",
@@ -483,7 +489,7 @@ async def list_curricular_areas_v1(
 async def list_difficulty_levels_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_view(ctx, db)
     return {"items": list_difficulty_levels_meta()}
 
 
@@ -492,7 +498,7 @@ async def list_disciplines_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_view(ctx, db)
     rows = await fetch_all(
         db,
         """
@@ -528,7 +534,7 @@ async def list_question_items_v1(
     difficulty_level: str | None = None,
     question_type: str | None = None,
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_view(ctx, db)
 
     where = ["TRUE"]
     params: dict[str, Any] = {
@@ -649,7 +655,7 @@ async def get_question_item_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_view(ctx, db)
     row = await _fetch_question_row(db, question_id)
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Questão não encontrada")
@@ -664,7 +670,7 @@ async def create_question_item_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_manage(ctx, db)
 
     # Formulário editorial sempre grava na origem PP (ignora source_id do client).
     source_id = await _ensure_pp_source(db)
@@ -779,7 +785,7 @@ async def update_question_item_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_edit(ctx, db)
     existing = await _fetch_question_row(db, question_id)
     if not existing:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Questão não encontrada")
@@ -892,7 +898,7 @@ async def delete_question_item_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_platform_admin(ctx)
+    await _assert_questions_manage(ctx, db)
     existing = await _fetch_question_row(db, question_id)
     if not existing:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Questão não encontrada")
