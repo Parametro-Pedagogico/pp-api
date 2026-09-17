@@ -17,6 +17,7 @@ from app.v1.profiles_router import router as profiles_router
 from app.v1.question_items_router import router as question_items_router
 from app.v1.navigation_admin_router import router as navigation_admin_router
 from app.v1.role_definitions_router import router as role_definitions_router
+from app.v1.status_page_admin_router import router as status_page_admin_router
 
 router = APIRouter()
 
@@ -30,6 +31,7 @@ router.include_router(directory_router, tags=["v1-directory"])
 router.include_router(assessments_router, tags=["v1-assessments"])
 router.include_router(assessment_response_import_router, tags=["v1-assessment-import"])
 router.include_router(role_definitions_router, tags=["v1-role-definitions-admin"])
+router.include_router(status_page_admin_router, tags=["v1-status-page-admin"])
 router.include_router(navigation_admin_router, tags=["v1-navigation-admin"])
 router.include_router(question_items_router, tags=["v1-question-items"])
 router.include_router(exam_report_router, tags=["v1-exam-reports"])

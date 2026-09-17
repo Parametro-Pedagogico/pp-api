@@ -19,6 +19,7 @@ from app.domains.me.router import router as me_router
 from app.v1.auth.schemas import FirebaseExchangeResponseV1, SignInRequestV1
 from app.v1.auth.service import firebase_sign_in_with_password_v1
 from app.v1.router import router as v1_router
+from app.status_router import router as status_router
 from app.v1.chat_router import ChatRequest, chat_v1
 
 
@@ -137,6 +138,7 @@ async def post_api_chat(
 
 
 app.include_router(_api_chat_compat)
+app.include_router(status_router)
 
 
 @app.get(
