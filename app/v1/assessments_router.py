@@ -31,6 +31,8 @@ from app.domains.rbac.module_access_service import (
     get_module_access_level,
 )
 from app.v1._sql import execute, fetch_all, fetch_one
+from app.v1.question_difficulty import difficulty_level_label
+from app.v1.question_types import question_type_label
 from app.v1.cartao_resposta_pdf import (
     build_cartao_resposta_pdf_bytes_from_view_row,
     merge_pdf_bytes,
@@ -186,13 +188,60 @@ async def _assert_schedule_attendance_editor(db: AsyncSession, ctx: AuthContext,
 
 
 class AssessmentCreate(BaseModel):
-    school_id: UUID
+    school_id: UUID | None = None
     title: str
     description: str | None = None
     assessment_type: str | None = Field(default=None, alias="type")
     created_by: UUID
 
     model_config = {"populate_by_name": True}
+
+
+async def _assessment_linked_to_schools(
+    db: AsyncSession,
+    assessment_id: UUID,
+    school_ids: list[str],
+) -> bool:
+    if not school_ids:
+        return True
+    row = await fetch_one(
+        db,
+        """
+        SELECT 1 AS ok
+        FROM assessment_school
+        WHERE assessment_id = CAST(:aid AS uuid)
+          AND school_id = ANY(CAST(:sids AS uuid[]))
+        LIMIT 1
+        """,
+        {"aid": str(assessment_id), "sids": school_ids},
+    )
+    return row is not None
+
+
+async def _assessment_in_school_scope(
+    db: AsyncSession,
+    *,
+    assessment_id: UUID,
+    primary_school_id: Any,
+    effective_school_ids: list[Any] | None,
+) -> bool:
+    if effective_school_ids is None:
+        return True
+    scope = {str(x) for x in effective_school_ids}
+    if primary_school_id and str(primary_school_id) in scope:
+        return True
+    return await _assessment_linked_to_schools(db, assessment_id, list(scope))
+
+
+def _school_scope_sql(*, alias: str, param: str) -> str:
+    return f"""(
+      {alias}.school_id = ANY(CAST(:{param} AS uuid[]))
+      OR EXISTS (
+        SELECT 1 FROM assessment_school ash
+        WHERE ash.assessment_id = {alias}.id
+          AND ash.school_id = ANY(CAST(:{param} AS uuid[]))
+      )
+    )"""
 
 
 class AssessmentPatch(BaseModel):
@@ -217,28 +266,29 @@ async def list_assessments_v1(
     platform_catalog = await _has_platform_module_access(db, ctx, ASSESSMENTS_MODULE, "VIEW")
     sql = "SELECT * FROM assessments WHERE 1=1"
     params: dict[str, Any] = {}
-    sql += """
-    AND EXISTS (
-      SELECT 1
-      FROM assessment_schedules ass
-      JOIN classrooms c ON c.id = ass.classroom_id
-      WHERE ass.assessment_id = assessments.id
-        AND c.academic_year_id = CAST(:ay AS uuid)
-    )
-    """
-    params["ay"] = str(effective_ay)
+    if not platform_catalog:
+        sql += """
+        AND EXISTS (
+          SELECT 1
+          FROM assessment_schedules ass
+          JOIN classrooms c ON c.id = ass.classroom_id
+          WHERE ass.assessment_id = assessments.id
+            AND c.academic_year_id = CAST(:ay AS uuid)
+        )
+        """
+        params["ay"] = str(effective_ay)
     if school_id:
         if not sscope["is_admin_like"]:
             if str(school_id) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "Escola fora do escopo")
-            sql += " AND school_id = CAST(:sid AS uuid)"
-            params["sid"] = str(school_id)
+            sql += f" AND {_school_scope_sql(alias='assessments', param='school_subtree')}"
+            params["school_subtree"] = [str(school_id)]
         else:
             subtree = await get_descendant_school_ids(db, school_id)
-            sql += " AND school_id = ANY(CAST(:school_subtree AS uuid[]))"
+            sql += f" AND {_school_scope_sql(alias='assessments', param='school_subtree')}"
             params["school_subtree"] = [str(x) for x in subtree]
     elif not sscope["is_admin_like"] and not platform_catalog:
-        sql += " AND school_id = ANY(CAST(:sids AS uuid[]))"
+        sql += f" AND {_school_scope_sql(alias='assessments', param='sids')}"
         params["sids"] = [str(x) for x in (sscope["effective_school_ids"] or [])]
     count_row = await fetch_one(db, f"SELECT COUNT(*)::int AS total FROM ({sql}) q", params)
     items = await fetch_all(
@@ -256,27 +306,52 @@ async def create_assessment_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     sscope = await get_effective_school_scope(db, ctx)
-    if not sscope["is_admin_like"]:
+    if body.school_id is None:
+        if not sscope["is_admin_like"]:
+            await _assert_assessments_manage(db, ctx)
+    elif not sscope["is_admin_like"]:
         if not await _has_platform_module_access(db, ctx, ASSESSMENTS_MODULE, "MANAGE"):
             if str(body.school_id) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
                 raise HTTPException(status.HTTP_403_FORBIDDEN, "Escola fora do escopo")
         else:
             await _assert_assessments_manage(db, ctx)
+    sch_sql = "CAST(:sch AS uuid)" if body.school_id else "NULL"
     row = await fetch_one(
         db,
-        """
+        f"""
         INSERT INTO assessments (school_id, created_by, title, description, type)
-        VALUES (CAST(:sch AS uuid), CAST(:cb AS uuid), :title, :desc, :typ)
+        VALUES ({sch_sql}, CAST(:cb AS uuid), :title, :desc, :typ)
         RETURNING *
         """,
         {
-            "sch": str(body.school_id),
+            **({"sch": str(body.school_id)} if body.school_id else {}),
             "cb": str(body.created_by),
             "title": body.title,
             "desc": body.description,
             "typ": body.assessment_type,
         },
     )
+    assert row is not None
+    if body.school_id:
+        dup = await fetch_one(
+            db,
+            """
+            SELECT id FROM assessment_school
+            WHERE assessment_id = CAST(:a AS uuid) AND school_id = CAST(:s AS uuid)
+            LIMIT 1
+            """,
+            {"a": str(row["id"]), "s": str(body.school_id)},
+        )
+        if not dup:
+            await fetch_one(
+                db,
+                """
+                INSERT INTO assessment_school (assessment_id, school_id, active)
+                VALUES (CAST(:a AS uuid), CAST(:s AS uuid), true)
+                RETURNING id
+                """,
+                {"a": str(row["id"]), "s": str(body.school_id)},
+            )
     await db.commit()
     return row
 
@@ -296,7 +371,12 @@ async def get_assessment_v1(
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Assessment not found")
     if not sscope["is_admin_like"]:
-        in_scope = str(row["school_id"]) in {str(x) for x in (sscope["effective_school_ids"] or [])}
+        in_scope = await _assessment_in_school_scope(
+            db,
+            assessment_id=assessment_id,
+            primary_school_id=row.get("school_id"),
+            effective_school_ids=sscope["effective_school_ids"],
+        )
         if not in_scope and not await _has_platform_module_access(db, ctx, ASSESSMENTS_MODULE, "VIEW"):
             raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
     return row
@@ -382,8 +462,8 @@ async def post_assessment_school_v1(
     row = await fetch_one(
         db,
         """
-        INSERT INTO assessment_school (assessment_id, school_id)
-        VALUES (CAST(:a AS uuid), CAST(:s AS uuid))
+        INSERT INTO assessment_school (assessment_id, school_id, active)
+        VALUES (CAST(:a AS uuid), CAST(:s AS uuid), true)
         RETURNING *
         """,
         {"a": str(assessment_id), "s": str(body.school_id)},
@@ -441,6 +521,237 @@ async def delete_assessment_school_v1(
     )
     await db.commit()
     return {"ok": True}
+
+
+def _serialize_assessment_question_link(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "link_id": str(row["link_id"]),
+        "order_index": int(row["order_index"]) if row.get("order_index") is not None else None,
+        "id": str(row["question_id"]),
+        "source_id": str(row["source_id"]),
+        "source_name": row.get("source_name"),
+        "external_id": row.get("external_id"),
+        "external_code": row.get("external_code"),
+        "description_html": row.get("description_html"),
+        "description_raw": row.get("description_raw"),
+        "additional_text_html": row.get("additional_text_html"),
+        "additional_text_raw": row.get("additional_text_raw"),
+        "segment_name": row.get("segment_name"),
+        "question_type": row.get("question_type"),
+        "question_type_label": question_type_label(row.get("question_type")),
+        "difficulty_level": row.get("difficulty_level"),
+        "difficulty_level_label": difficulty_level_label(row.get("difficulty_level")),
+        "discipline_name": row.get("discipline_catalog_name") or row.get("discipline_name"),
+        "exam_year": row.get("exam_year"),
+        "area_slug": row.get("area_slug"),
+        "area_name": row.get("area_name"),
+    }
+
+
+class AssessmentQuestionItemsAdd(BaseModel):
+    question_ids: list[UUID] = Field(default_factory=list, min_length=1)
+
+
+class AssessmentQuestionItemsOrder(BaseModel):
+    question_ids: list[UUID] = Field(default_factory=list)
+
+
+@router.get("/assessments/{assessment_id}/question-items")
+async def list_assessment_question_items_v1(
+    assessment_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await get_assessment_v1(assessment_id, ctx, db)
+    await _assert_assessments_view(db, ctx)
+    rows = await fetch_all(
+        db,
+        """
+        SELECT
+          qa.id AS link_id,
+          qa.order_index,
+          qi.id AS question_id,
+          qi.source_id,
+          qs.name AS source_name,
+          qi.external_id,
+          qi.external_code,
+          qi.description_html,
+          qi.description_raw,
+          qi.additional_text_html,
+          qi.additional_text_raw,
+          qi.question_type,
+          qi.difficulty_level,
+          qi.discipline_name,
+          qi.exam_year,
+          qi.area_slug,
+          ca.name AS area_name,
+          seg.name AS segment_name,
+          disc.name AS discipline_catalog_name
+        FROM questions_assessments qa
+        JOIN question_item qi ON qi.id = qa.question_id
+        JOIN question_source qs ON qs.id = qi.source_id
+        LEFT JOIN curricular_areas ca ON ca.slug = qi.area_slug
+        LEFT JOIN segments seg ON seg.id = qi.segment_id
+        LEFT JOIN disciplines disc ON disc.id = qi.discipline_id
+        WHERE qa.assessment_id = CAST(:aid AS uuid)
+        ORDER BY qa.order_index NULLS LAST, qi.external_code, qi.external_id
+        """,
+        {"aid": str(assessment_id)},
+    )
+    return {"items": [_serialize_assessment_question_link(r) for r in rows], "total": len(rows)}
+
+
+@router.post("/assessments/{assessment_id}/question-items")
+async def add_assessment_question_items_v1(
+    assessment_id: UUID,
+    body: AssessmentQuestionItemsAdd,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await get_assessment_v1(assessment_id, ctx, db)
+    if is_admin_like(ctx.role):
+        pass
+    else:
+        await _assert_assessments_edit(db, ctx)
+
+    max_row = await fetch_one(
+        db,
+        """
+        SELECT COALESCE(MAX(order_index), 0)::bigint AS max_order
+        FROM questions_assessments
+        WHERE assessment_id = CAST(:aid AS uuid)
+        """,
+        {"aid": str(assessment_id)},
+    )
+    next_order = int((max_row or {}).get("max_order") or 0)
+
+    added: list[str] = []
+    skipped: list[str] = []
+    for question_id in body.question_ids:
+        exists = await fetch_one(
+            db,
+            """
+            SELECT id FROM questions_assessments
+            WHERE assessment_id = CAST(:aid AS uuid)
+              AND question_id = CAST(:qid AS uuid)
+            LIMIT 1
+            """,
+            {"aid": str(assessment_id), "qid": str(question_id)},
+        )
+        if exists:
+            skipped.append(str(question_id))
+            continue
+        qrow = await fetch_one(
+            db,
+            "SELECT id FROM question_item WHERE id = CAST(:id AS uuid)",
+            {"id": str(question_id)},
+        )
+        if not qrow:
+            raise HTTPException(
+                status.HTTP_404_NOT_FOUND,
+                f"Questão não encontrada: {question_id}",
+            )
+        next_order += 1
+        await fetch_one(
+            db,
+            """
+            INSERT INTO questions_assessments (assessment_id, question_id, order_index)
+            VALUES (CAST(:aid AS uuid), CAST(:qid AS uuid), :ord)
+            RETURNING id
+            """,
+            {"aid": str(assessment_id), "qid": str(question_id), "ord": next_order},
+        )
+        added.append(str(question_id))
+
+    await db.commit()
+    return {"added": added, "skipped": skipped, "added_count": len(added)}
+
+
+@router.delete("/assessments/{assessment_id}/question-items/{question_id}")
+async def delete_assessment_question_item_v1(
+    assessment_id: UUID,
+    question_id: UUID,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await get_assessment_v1(assessment_id, ctx, db)
+    if is_admin_like(ctx.role):
+        pass
+    elif await _has_platform_module_access(db, ctx, ASSESSMENTS_MODULE, "MANAGE"):
+        await _assert_assessments_manage(db, ctx)
+    else:
+        await _assert_assessments_edit(db, ctx)
+
+    row = await fetch_one(
+        db,
+        """
+        SELECT id FROM questions_assessments
+        WHERE assessment_id = CAST(:aid AS uuid)
+          AND question_id = CAST(:qid AS uuid)
+        LIMIT 1
+        """,
+        {"aid": str(assessment_id), "qid": str(question_id)},
+    )
+    if not row:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Questão não vinculada a este caderno")
+    await execute(
+        db,
+        """
+        DELETE FROM questions_assessments
+        WHERE assessment_id = CAST(:aid AS uuid)
+          AND question_id = CAST(:qid AS uuid)
+        """,
+        {"aid": str(assessment_id), "qid": str(question_id)},
+    )
+    await db.commit()
+    return {"ok": True}
+
+
+@router.put("/assessments/{assessment_id}/question-items/order")
+async def reorder_assessment_question_items_v1(
+    assessment_id: UUID,
+    body: AssessmentQuestionItemsOrder,
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    await get_assessment_v1(assessment_id, ctx, db)
+    if is_admin_like(ctx.role):
+        pass
+    else:
+        await _assert_assessments_edit(db, ctx)
+
+    existing_rows = await fetch_all(
+        db,
+        """
+        SELECT question_id::text AS question_id
+        FROM questions_assessments
+        WHERE assessment_id = CAST(:aid AS uuid)
+        """,
+        {"aid": str(assessment_id)},
+    )
+    existing_ids = {str(r["question_id"]) for r in existing_rows}
+    provided_ids = [str(qid) for qid in body.question_ids]
+
+    if existing_ids != set(provided_ids):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "A lista deve conter exatamente as questões vinculadas ao caderno, na ordem desejada",
+        )
+
+    for index, question_id in enumerate(provided_ids, start=1):
+        await execute(
+            db,
+            """
+            UPDATE questions_assessments
+            SET order_index = :ord
+            WHERE assessment_id = CAST(:aid AS uuid)
+              AND question_id = CAST(:qid AS uuid)
+            """,
+            {"aid": str(assessment_id), "qid": question_id, "ord": index},
+        )
+
+    await db.commit()
+    return {"ok": True, "total": len(provided_ids)}
 
 
 async def _student_assessment_summary_rows(
@@ -737,7 +1048,9 @@ async def _assessment_covers_classroom_school(
     classroom_school_id: Any,
 ) -> bool:
     """True se a turma pertence à mesma escola «principal» da avaliação ou há vínculo em assessment_school."""
-    if str(assessment_primary_school_id) == str(classroom_school_id):
+    if assessment_primary_school_id is None:
+        pass
+    elif str(assessment_primary_school_id) == str(classroom_school_id):
         return True
     row = await fetch_one(
         db,

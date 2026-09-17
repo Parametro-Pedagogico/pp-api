@@ -227,6 +227,13 @@ async def resolve_user_navigation(
             }
         )
 
+    if is_platform_admin_role(ctx.role):
+        for group in groups:
+            for item in group["items"]:
+                item["access_level"] = "MANAGE"
+        for module in modules_catalog:
+            module["access_level"] = "MANAGE"
+
     return {
         "version": await compute_navigation_version(db),
         "effective_role_code": effective_code,

@@ -2430,7 +2430,7 @@ async def admin_dashboard_cockpit_v1(
     schedule_rows = await fetch_all(
         db,
         f"""
-        SELECT s.id, s.start_time, s.end_time, s.macro_assessment_id,
+        SELECT s.id, s.start_time, s.end_time, a.macro_assessment_id,
                a.title AS assessment_title, c.name AS classroom_name
         FROM assessment_schedules s
         JOIN classrooms c ON c.id = s.classroom_id
