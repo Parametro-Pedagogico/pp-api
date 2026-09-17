@@ -20,6 +20,9 @@ from app.v1._scope import (
     is_teacher_like,
     resolve_admin_dashboard_school_ids,
 )
+
+_IMPORT_FAILED_STATUSES = ("import_failed", "validation_failed")
+_IMPORT_PENDING_STATUSES = ("pending", "parsed", "validated", "importing")
 from app.v1._sql import execute, fetch_all, fetch_one
 from app.v1.attendance_sheet_storage import load_attendance_sheet_bytes
 from app.v1.directory_router import _student_scope_read
@@ -2317,6 +2320,151 @@ async def admin_kpi_v1(
     comp = int(out.get("completed_assessments") or 0)
     out["pending_assessments"] = max(0, sch - comp)
     return out
+
+
+@router.get("/admin/dashboard/cockpit")
+async def admin_dashboard_cockpit_v1(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+    school_id: UUID | None = Query(
+        None,
+        description="Recorte por árvore de escola (mesmo contrato do KPI admin).",
+    ),
+):
+    """Agregados leves para o cockpit operacional da home admin (SPR-ADM-UX-COCKPIT)."""
+    ay = await resolve_academic_year_id(db, academic_year_id)
+    school_ids: list[UUID] | None = await resolve_admin_dashboard_school_ids(
+        db, ctx, school_id
+    )
+    extra_sql, extra_params = _admin_classroom_scope_sql(school_ids)
+    params: dict[str, Any] = {"ay": str(ay), **extra_params}
+
+    q_row = await fetch_one(db, "SELECT COUNT(*)::int AS n FROM question_item", {})
+    question_bank_total = int((q_row or {}).get("n") or 0)
+
+    imports_failed = 0
+    imports_pending = 0
+    import_exceptions: list[dict[str, Any]] = []
+    if is_admin_like(ctx.role):
+        failed_in = ", ".join(f"'{s}'" for s in _IMPORT_FAILED_STATUSES)
+        pending_in = ", ".join(f"'{s}'" for s in _IMPORT_PENDING_STATUSES)
+        counts = await fetch_one(
+            db,
+            f"""
+            SELECT
+              COUNT(*) FILTER (WHERE status IN ({failed_in}))::int AS failed,
+              COUNT(*) FILTER (WHERE status IN ({pending_in}))::int AS pending
+            FROM assessment_response_import_batch
+            """,
+            {},
+        )
+        imports_failed = int((counts or {}).get("failed") or 0)
+        imports_pending = int((counts or {}).get("pending") or 0)
+
+        failed_rows = await fetch_all(
+            db,
+            f"""
+            SELECT id, original_filename, status, created_at
+            FROM assessment_response_import_batch
+            WHERE status IN ({failed_in})
+            ORDER BY created_at DESC
+            LIMIT 8
+            """,
+            {},
+        )
+        for r in failed_rows:
+            import_exceptions.append(
+                {
+                    "batch_id": str(r["id"]),
+                    "original_filename": r.get("original_filename"),
+                    "status": r.get("status"),
+                    "created_at": str(r["created_at"]) if r.get("created_at") else None,
+                    "kind": "import_failed",
+                }
+            )
+
+        pending_rows = await fetch_all(
+            db,
+            f"""
+            SELECT id, original_filename, status, created_at
+            FROM assessment_response_import_batch
+            WHERE status IN ({pending_in})
+            ORDER BY created_at DESC
+            LIMIT 8
+            """,
+            {},
+        )
+        for r in pending_rows:
+            import_exceptions.append(
+                {
+                    "batch_id": str(r["id"]),
+                    "original_filename": r.get("original_filename"),
+                    "status": r.get("status"),
+                    "created_at": str(r["created_at"]) if r.get("created_at") else None,
+                    "kind": "import_pending",
+                }
+            )
+
+    upcoming_filter = """
+      (
+        (s.start_time >= (now() AT TIME ZONE 'utc')
+         AND s.start_time <= (now() AT TIME ZONE 'utc') + interval '7 days')
+        OR (s.start_time <= (now() AT TIME ZONE 'utc')
+            AND s.end_time >= (now() AT TIME ZONE 'utc'))
+      )
+    """
+    upcoming_row = await fetch_one(
+        db,
+        f"""
+        SELECT COUNT(*)::int AS n
+        FROM assessment_schedules s
+        JOIN classrooms c ON c.id = s.classroom_id
+        WHERE c.academic_year_id = CAST(:ay AS uuid) {extra_sql}
+          AND {upcoming_filter}
+        """,
+        params,
+    )
+    upcoming_schedules = int((upcoming_row or {}).get("n") or 0)
+
+    schedule_rows = await fetch_all(
+        db,
+        f"""
+        SELECT s.id, s.start_time, s.end_time, s.macro_assessment_id,
+               a.title AS assessment_title, c.name AS classroom_name
+        FROM assessment_schedules s
+        JOIN classrooms c ON c.id = s.classroom_id
+        JOIN assessments a ON a.id = s.assessment_id
+        WHERE c.academic_year_id = CAST(:ay AS uuid) {extra_sql}
+          AND {upcoming_filter}
+        ORDER BY s.start_time ASC NULLS LAST
+        LIMIT 8
+        """,
+        params,
+    )
+    schedule_exceptions = [
+        {
+            "schedule_id": str(r["id"]),
+            "assessment_title": r.get("assessment_title"),
+            "classroom_name": r.get("classroom_name"),
+            "start_time": str(r["start_time"]) if r.get("start_time") else None,
+            "macro_assessment_id": str(r["macro_assessment_id"])
+            if r.get("macro_assessment_id")
+            else None,
+            "kind": "schedule_upcoming",
+        }
+        for r in schedule_rows
+    ]
+
+    return {
+        "academic_year_id": str(ay),
+        "question_bank_total": question_bank_total,
+        "imports_failed": imports_failed,
+        "imports_pending": imports_pending,
+        "upcoming_schedules": upcoming_schedules,
+        "import_exceptions": import_exceptions[:12],
+        "schedule_exceptions": schedule_exceptions,
+    }
 
 
 _DOW_PT = ("Dom", "Seg", "Ter", "Qua", "Qui", "Sex", "Sáb")
