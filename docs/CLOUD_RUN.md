@@ -131,6 +131,7 @@ Produção: serviço **`pp-api`** na região **`us-central1`** (`https://pp-api-
 - **Gatilho:** push na branch **`main`** do repositório GitHub **`Parametro-Pedagogico/pp-api`** (Cloud Build → Gatilhos).
 - **Fluxo:** build da imagem (`Dockerfile`) → push para `us-central1-docker.pkg.dev/.../cloud-run-source-deploy/pp-api/pp-api:$COMMIT_SHA` → `gcloud run services update pp-api --region=us-central1 --image=...`.
 - O deploy **só troca a imagem**; variáveis de ambiente e secrets configurados no serviço Cloud Run **permanecem** na revisão nova.
+- No serviço, o tráfego deve estar em **100% → Revisão mais recente (LATEST)**. Se estiver fixo numa revisão antiga (`update-traffic --to-revisions=…`), o gatilho cria imagem nova mas o tráfego não muda.
 
 Deploy manual (emergência): `GCP_REGION=us-central1 make deploy-source` — use a **mesma região** do gatilho; não crie outro serviço em `southamerica-east1`.
 
