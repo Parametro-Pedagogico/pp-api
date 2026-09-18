@@ -123,3 +123,20 @@ Com `reportlab` e vários routers, o arranque pode ser pesado. Se ainda falhar p
 ## Timeout
 
 Se o Postgres estiver longe ou lento, aumenta **CPU startup** / **request timeout** na revisão, ou usa **Cloud SQL connector** + instância próxima da região do serviço.
+
+## Deploy automático (Cloud Build)
+
+Produção: serviço **`pp-api`** na região **`us-central1`** (`https://pp-api-521006336685.us-central1.run.app`).
+
+- **Gatilho:** push na branch **`main`** do repositório GitHub **`Parametro-Pedagogico/pp-api`** (Cloud Build → Gatilhos).
+- **Fluxo:** build da imagem (`Dockerfile`) → push para `us-central1-docker.pkg.dev/.../cloud-run-source-deploy/pp-api/pp-api:$COMMIT_SHA` → `gcloud run services update pp-api --region=us-central1 --image=...`.
+- O deploy **só troca a imagem**; variáveis de ambiente e secrets configurados no serviço Cloud Run **permanecem** na revisão nova.
+
+Deploy manual (emergência): `GCP_REGION=us-central1 make deploy-source` — use a **mesma região** do gatilho; não crie outro serviço em `southamerica-east1`.
+
+Reexecutar o gatilho sem commit:
+
+```bash
+gcloud builds triggers run rmgpgab-pp-api-us-central1-fmvalle-pp-api--maqnw \
+  --branch=main --project=studious-union-475223-m8
+```

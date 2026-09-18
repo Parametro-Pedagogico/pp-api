@@ -21,7 +21,7 @@ PORT        ?= 8002
 # ----------------------------------------------------------------------------
 GCP_PROJECT_ID     ?= studious-union-475223-m8
 GCP_PROJECT_NUMBER ?= 521006336685
-GCP_REGION         ?= southamerica-east1
+GCP_REGION         ?= us-central1
 
 SERVICE     ?= pp-api
 AR_REPO     ?= pp
