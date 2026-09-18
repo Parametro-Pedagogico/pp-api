@@ -21,6 +21,7 @@ from app.v1._scope import (
     is_staff_admin_role,
     is_teacher_like,
 )
+from app.v1._catalog_order import segment_order_key_sql
 from app.v1._sql import execute, fetch_all, fetch_one
 
 router = APIRouter(tags=["v1-catalog"])
@@ -796,7 +797,12 @@ async def filters_segments_v1(
     _: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    return await fetch_all(db, "SELECT * FROM segments ORDER BY name", {})
+    seg_order = segment_order_key_sql("s.name")
+    return await fetch_all(
+        db,
+        f"SELECT s.* FROM segments s ORDER BY {seg_order}, LOWER(s.name)",
+        {},
+    )
 
 
 @router.get("/filters/grades")
@@ -805,12 +811,18 @@ async def filters_grades_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
     segment_id: UUID | None = None,
 ):
-    sql = "SELECT * FROM grades WHERE 1=1"
+    seg_order = segment_order_key_sql("s.name")
+    sql = """
+        SELECT g.*
+        FROM grades g
+        LEFT JOIN segments s ON s.id = g.segment_id
+        WHERE 1=1
+    """
     params: dict[str, Any] = {}
     if segment_id:
-        sql += " AND segment_id = CAST(:seg AS uuid)"
+        sql += " AND g.segment_id = CAST(:seg AS uuid)"
         params["seg"] = str(segment_id)
-    sql += " ORDER BY name"
+    sql += f" ORDER BY {seg_order}, LOWER(g.name)"
     return await fetch_all(db, sql, params)
 
 

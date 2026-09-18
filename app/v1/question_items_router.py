@@ -16,6 +16,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import AuthContext, get_auth_context
 from app.db.session import get_db
+from app.v1._catalog_order import curricular_area_label_order_sql, discipline_name_order_sql
 from app.v1._paging import PageArgs, paged_response, pagination_params
 from app.v1._sql import execute, fetch_all, fetch_one
 from app.domains.rbac.module_access_service import assert_module_access
@@ -122,6 +123,8 @@ def _serialize_question(
         "additional_text_raw": row.get("additional_text_raw"),
         "segment_id": str(row["segment_id"]) if row.get("segment_id") else None,
         "segment_name": row.get("segment_name"),
+        "grade_id": str(row["grade_id"]) if row.get("grade_id") else None,
+        "grade_name": row.get("grade_name"),
         "question_type": row.get("question_type"),
         "question_type_label": question_type_label(row.get("question_type")),
         "difficulty_level": row.get("difficulty_level"),
@@ -168,6 +171,7 @@ class QuestionItemCreate(BaseModel):
     additional_text_html: str | None = None
     additional_text_raw: str | None = None
     segment_id: UUID | None = None
+    grade_id: UUID | None = None
     question_type: str | None = None
     difficulty_level: str | None = None
     has_teacher_comment: bool = False
@@ -190,6 +194,7 @@ class QuestionItemUpdate(BaseModel):
     additional_text_html: str | None = None
     additional_text_raw: str | None = None
     segment_id: UUID | None = None
+    grade_id: UUID | None = None
     question_type: str | None = None
     difficulty_level: str | None = None
     has_teacher_comment: bool | None = None
@@ -238,6 +243,59 @@ async def _load_assessments(db: AsyncSession, question_id: UUID) -> list[dict[st
         }
         for r in rows
     ]
+
+
+async def _validate_grade_id(
+    db: AsyncSession,
+    grade_id: UUID | None,
+    segment_id: UUID | None = None,
+) -> None:
+    if grade_id is None:
+        return
+    row = await fetch_one(
+        db,
+        "SELECT id, segment_id FROM grades WHERE id = CAST(:id AS uuid)",
+        {"id": str(grade_id)},
+    )
+    if not row:
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Série inválida")
+    if segment_id and str(row["segment_id"]) != str(segment_id):
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Série não pertence ao segmento selecionado")
+
+
+async def _validate_discipline_for_grade(
+    db: AsyncSession,
+    discipline_id: UUID | None,
+    grade_id: UUID | None,
+    area_slug: str | None,
+) -> None:
+    if discipline_id is None:
+        return
+    if grade_id:
+        link = await fetch_one(
+            db,
+            """
+            SELECT 1 AS x FROM grade_disciplines
+            WHERE grade_id = CAST(:gid AS uuid) AND discipline_id = CAST(:did AS uuid)
+            """,
+            {"gid": str(grade_id), "did": str(discipline_id)},
+        )
+        if not link:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Disciplina não vinculada à série selecionada",
+            )
+    if area_slug:
+        disc = await fetch_one(
+            db,
+            "SELECT area_slug FROM disciplines WHERE id = CAST(:id AS uuid)",
+            {"id": str(discipline_id)},
+        )
+        if disc and disc.get("area_slug") and disc["area_slug"] != area_slug:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "Disciplina não pertence à área selecionada",
+            )
 
 
 async def _validate_segment_id(db: AsyncSession, segment_id: UUID | None) -> None:
@@ -307,6 +365,7 @@ async def _fetch_question_row(db: AsyncSession, question_id: UUID) -> dict[str, 
           qs.name AS source_name,
           ca.name AS area_name,
           seg.name AS segment_name,
+          g.name AS grade_name,
           disc.name AS discipline_catalog_name,
           (
             SELECT COUNT(*)::int
@@ -317,6 +376,7 @@ async def _fetch_question_row(db: AsyncSession, question_id: UUID) -> dict[str, 
         JOIN question_source qs ON qs.id = qi.source_id
         LEFT JOIN curricular_areas ca ON ca.slug = qi.area_slug
         LEFT JOIN segments seg ON seg.id = qi.segment_id
+        LEFT JOIN grades g ON g.id = qi.grade_id
         LEFT JOIN disciplines disc ON disc.id = qi.discipline_id
         WHERE qi.id = CAST(:id AS uuid)
         """,
@@ -465,6 +525,7 @@ async def list_question_sources_v1(
 @router.get("/meta/question-types")
 async def list_question_types_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     await _assert_questions_view(ctx, db)
     return {"items": list_question_types_meta()}
@@ -474,20 +535,44 @@ async def list_question_types_v1(
 async def list_curricular_areas_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    grade_id: UUID | None = Query(None),
 ):
     await _assert_questions_view(ctx, db)
-    rows = await fetch_all(
-        db,
-        "SELECT slug, name FROM curricular_areas ORDER BY name",
-    )
+    area_order = curricular_area_label_order_sql("ca")
+    if grade_id:
+        rows = await fetch_all(
+            db,
+            f"""
+            SELECT ca.slug, ca.name, ca.official_name
+            FROM curricular_areas ca
+            JOIN grade_curricular_areas gca ON gca.area_slug = ca.slug
+            WHERE gca.grade_id = CAST(:gid AS uuid)
+            ORDER BY {area_order}
+            """,
+            {"gid": str(grade_id)},
+        )
+    else:
+        rows = await fetch_all(
+            db,
+            f"SELECT slug, name, official_name FROM curricular_areas ca ORDER BY {area_order}",
+            {},
+        )
     return {
-        "items": [{"slug": r["slug"], "name": r["name"]} for r in rows]
+        "items": [
+            {
+                "slug": r["slug"],
+                "name": r["name"],
+                "official_name": r.get("official_name"),
+            }
+            for r in rows
+        ]
     }
 
 
 @router.get("/meta/difficulty-levels")
 async def list_difficulty_levels_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
 ):
     await _assert_questions_view(ctx, db)
     return {"items": list_difficulty_levels_meta()}
@@ -497,16 +582,45 @@ async def list_difficulty_levels_v1(
 async def list_disciplines_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
+    grade_id: UUID | None = Query(None),
+    area_slug: str | None = Query(None),
 ):
     await _assert_questions_view(ctx, db)
-    rows = await fetch_all(
-        db,
-        """
-        SELECT id, name, slug, area_slug
-        FROM disciplines
-        ORDER BY name
-        """,
-    )
+    where = ["1=1"]
+    params: dict[str, Any] = {}
+    if grade_id:
+        where.append(
+            "d.id IN (SELECT discipline_id FROM grade_disciplines WHERE grade_id = CAST(:gid AS uuid))"
+        )
+        params["gid"] = str(grade_id)
+    disc_order = discipline_name_order_sql("d")
+    if grade_id and area_slug:
+        rows = await fetch_all(
+            db,
+            f"""
+            SELECT d.id, d.name, d.slug, d.area_slug, d.official_name, d.bncc_component_code
+            FROM grade_area_disciplines gad
+            JOIN disciplines d ON d.id = gad.discipline_id
+            WHERE gad.grade_id = CAST(:gid AS uuid)
+              AND gad.area_slug = :area_slug
+            ORDER BY {disc_order}
+            """,
+            {"gid": str(grade_id), "area_slug": area_slug},
+        )
+    else:
+        if area_slug:
+            where.append("d.area_slug = :area_slug")
+            params["area_slug"] = area_slug
+        rows = await fetch_all(
+            db,
+            f"""
+            SELECT id, name, slug, area_slug, official_name, bncc_component_code
+            FROM disciplines d
+            WHERE {' AND '.join(where)}
+            ORDER BY {disc_order}
+            """,
+            params,
+        )
     return {
         "items": [
             {
@@ -602,6 +716,7 @@ async def list_question_items_v1(
           qs.name AS source_name,
           ca.name AS area_name,
           seg.name AS segment_name,
+          g.name AS grade_name,
           disc.name AS discipline_catalog_name,
           (
             SELECT COUNT(*)::int
@@ -626,6 +741,7 @@ async def list_question_items_v1(
         JOIN question_source qs ON qs.id = qi.source_id
         LEFT JOIN curricular_areas ca ON ca.slug = qi.area_slug
         LEFT JOIN segments seg ON seg.id = qi.segment_id
+        LEFT JOIN grades g ON g.id = qi.grade_id
         LEFT JOIN disciplines disc ON disc.id = qi.discipline_id
         WHERE {where_sql}
         ORDER BY qi.updated_at DESC NULLS LAST, qi.created_at DESC
@@ -685,6 +801,7 @@ async def create_question_item_v1(
             raise HTTPException(status.HTTP_400_BAD_REQUEST, "Área curricular inválida")
 
     await _validate_segment_id(db, body.segment_id)
+    await _validate_grade_id(db, body.grade_id, body.segment_id)
 
     try:
         validate_question_type(body.question_type)
@@ -697,6 +814,7 @@ async def create_question_item_v1(
         raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
     discipline_row = await _validate_discipline_id(db, body.discipline_id)
+    await _validate_discipline_for_grade(db, body.discipline_id, body.grade_id, body.area_slug)
 
     dup = await fetch_one(
         db,
@@ -731,14 +849,14 @@ async def create_question_item_v1(
           id, source_id, external_id, external_code,
           description_html, description_raw,
           additional_text_html, additional_text_raw,
-          segment_id, question_type, difficulty_level, has_teacher_comment,
+          segment_id, grade_id, question_type, difficulty_level, has_teacher_comment,
           discipline_id, discipline_external_id, discipline_name, discipline_slug,
           exam_year, exam_institute, area_slug, parameters, metadata
         ) VALUES (
           CAST(:id AS uuid), CAST(:source_id AS uuid), :external_id, :external_code,
           :description_html, :description_raw,
           :additional_text_html, :additional_text_raw,
-          CAST(:segment_id AS uuid), :question_type, :difficulty_level, :has_teacher_comment,
+          CAST(:segment_id AS uuid), CAST(:grade_id AS uuid), :question_type, :difficulty_level, :has_teacher_comment,
           CAST(:discipline_id AS uuid), :discipline_external_id, :discipline_name, :discipline_slug,
           :exam_year, :exam_institute, :area_slug,
           CAST(:parameters AS jsonb), CAST(:metadata AS jsonb)
@@ -754,6 +872,7 @@ async def create_question_item_v1(
             "additional_text_html": body.additional_text_html,
             "additional_text_raw": additional_text_raw,
             "segment_id": str(body.segment_id) if body.segment_id else None,
+            "grade_id": str(body.grade_id) if body.grade_id else None,
             "question_type": body.question_type,
             "difficulty_level": body.difficulty_level,
             "has_teacher_comment": body.has_teacher_comment,
@@ -812,6 +931,10 @@ async def update_question_item_v1(
     if "segment_id" in data:
         await _validate_segment_id(db, data.get("segment_id"))
 
+    segment_for_grade = data.get("segment_id", existing.get("segment_id"))
+    if "grade_id" in data:
+        await _validate_grade_id(db, data.get("grade_id"), segment_for_grade)
+
     if "question_type" in data:
         try:
             validate_question_type(data.get("question_type"))
@@ -824,8 +947,16 @@ async def update_question_item_v1(
         except ValueError as exc:
             raise HTTPException(status.HTTP_400_BAD_REQUEST, str(exc)) from exc
 
+    grade_for_validation = data.get("grade_id", existing.get("grade_id"))
+    area_for_validation = data.get("area_slug", existing.get("area_slug"))
     if "discipline_id" in data:
         discipline_row = await _validate_discipline_id(db, data.get("discipline_id"))
+        await _validate_discipline_for_grade(
+            db,
+            data.get("discipline_id"),
+            grade_for_validation,
+            area_for_validation,
+        )
         if discipline_row:
             data["discipline_name"] = discipline_row["name"]
             data["discipline_slug"] = discipline_row.get("slug")
@@ -844,6 +975,7 @@ async def update_question_item_v1(
             "additional_text_html": ("additional_text_html", ":additional_text_html"),
             "additional_text_raw": ("additional_text_raw", ":additional_text_raw"),
             "segment_id": ("segment_id", "CAST(:segment_id AS uuid)"),
+            "grade_id": ("grade_id", "CAST(:grade_id AS uuid)"),
             "question_type": ("question_type", ":question_type"),
             "difficulty_level": ("difficulty_level", ":difficulty_level"),
             "has_teacher_comment": ("has_teacher_comment", ":has_teacher_comment"),
@@ -866,7 +998,7 @@ async def update_question_item_v1(
                 params[key] = json.dumps(value) if value is not None else None
             elif key == "external_id" and value is not None:
                 params[key] = str(value).strip()
-            elif key in ("segment_id", "discipline_id"):
+            elif key in ("segment_id", "grade_id", "discipline_id"):
                 params[key] = str(value) if value is not None else None
             else:
                 params[key] = value

@@ -18,6 +18,7 @@ from app.v1.question_items_router import router as question_items_router
 from app.v1.navigation_admin_router import router as navigation_admin_router
 from app.v1.role_definitions_router import router as role_definitions_router
 from app.v1.status_page_admin_router import router as status_page_admin_router
+from app.v1.curricular_catalog_router import router as curricular_catalog_router
 
 router = APIRouter()
 
@@ -27,6 +28,7 @@ router.include_router(school_settings_router, tags=["v1-school-settings"])
 router.include_router(me_router, prefix="/me", tags=["v1-me"])
 router.include_router(profiles_router, tags=["v1-profiles"])
 router.include_router(catalog_router, tags=["v1-catalog"])
+router.include_router(curricular_catalog_router, tags=["v1-curricular-catalog"])
 router.include_router(directory_router, tags=["v1-directory"])
 router.include_router(assessments_router, tags=["v1-assessments"])
 router.include_router(assessment_response_import_router, tags=["v1-assessment-import"])
