@@ -12,16 +12,22 @@ import urllib.request
 
 from fastapi import HTTPException, status
 
+from app.core.firebase import auth_emulator_host
+
 
 def fetch_firebase_id_token_from_password(*, email: str, password: str, web_api_key: str) -> str:
     """Chama `signInWithPassword` e devolve o JWT `idToken` ou levanta HTTPException."""
     key = (web_api_key or "").strip()
+    emulator = auth_emulator_host()
+    if emulator and not key:
+        key = "dev-emulator"  # o emulador aceita qualquer chave
     if not key:
         raise HTTPException(
             status.HTTP_503_SERVICE_UNAVAILABLE,
             "sign-in com email/senha requer FIREBASE_WEB_API_KEY (chave Web do mesmo projeto Firebase).",
         )
-    url = f"https://identitytoolkit.googleapis.com/v1/accounts:signInWithPassword?key={key}"
+    base = f"http://{emulator}/identitytoolkit.googleapis.com" if emulator else "https://identitytoolkit.googleapis.com"
+    url = f"{base}/v1/accounts:signInWithPassword?key={key}"
     payload = json.dumps(
         {
             "email": (email or "").strip(),

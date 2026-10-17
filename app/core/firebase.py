@@ -102,11 +102,37 @@ def ensure_firebase_initialized() -> None:
     init_firebase()
 
 
+class _EmulatorCredential(credentials.Base):
+    """Credencial vazia para o emulador; o cliente de Auth do SDK usa a sua própria quando há emulador."""
+
+    def get_credential(self):
+        from firebase_admin import _utils
+
+        return _utils.EmulatorAdminCredentials()
+
+
+def auth_emulator_host() -> str:
+    """Host do Firebase Auth Emulator (ex.: `localhost:9099`), só em desenvolvimento."""
+    return (os.environ.get("FIREBASE_AUTH_EMULATOR_HOST") or "").strip()
+
+
 def init_firebase() -> None:
     if firebase_admin._apps:
         return
 
     opts = {"projectId": settings.firebase_project_id}
+
+    if auth_emulator_host():
+        # O SDK fala com o emulador e NÃO valida assinaturas de token. Para nunca ligar isso por engano
+        # num ambiente real, o emulador só é aceito com projeto de demonstração ("demo-...").
+        if not (settings.firebase_project_id or "").startswith("demo-"):
+            raise RuntimeError(
+                "Firebase Admin: FIREBASE_AUTH_EMULATOR_HOST só pode ser usado com FIREBASE_PROJECT_ID "
+                "de demonstração (demo-...). Remova a variável em ambientes reais."
+            )
+        logger.warning("Firebase Admin: usando Auth Emulator em %s (apenas desenvolvimento)", auth_emulator_host())
+        firebase_admin.initialize_app(_EmulatorCredential(), opts)
+        return
 
     cred_path = (settings.firebase_credentials_path or "").strip()
     if cred_path:

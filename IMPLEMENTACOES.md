@@ -66,3 +66,4 @@ existem como perfis próprios: definir esses perfis é um dos primeiros itens da
 |---|---|---|---|---|---|
 | 2026-10-16 | Organização | pp-api | Criação da branch e deste registro | (este commit) | Concluído |
 | 2026-10-17 | Organização | pp-api | Plano de execução dos 5 pontos (documento no `pp-app`: `docs/plano-execucao-5-pontos.md`) | (este commit) | Concluído |
+| 2026-10-17 | Serviços | pp-api | Fase 0: suporte ao Firebase Auth Emulator em desenvolvimento (`FIREBASE_AUTH_EMULATOR_HOST`) na inicialização do Admin SDK e no sign-in por e-mail e senha. Ambiente completo em `pp-app/dev` | (este commit) | Concluído |
