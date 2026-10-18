@@ -25,7 +25,7 @@ _log = logging.getLogger(__name__)
 def verify_firebase_id_token(id_token: str) -> dict:
     token = id_token.strip() if id_token else ""
     if not token:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing Firebase id_token")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Não foi possível confirmar seu acesso. Entre novamente.")
     try:
         ensure_firebase_initialized()
         decoded = firebase_auth.verify_id_token(token, check_revoked=settings.firebase_check_revoked)
@@ -67,7 +67,7 @@ def verify_firebase_id_token(id_token: str) -> dict:
 async def ensure_person_from_firebase(db: AsyncSession, decoded: dict) -> UUID:
     uid = decoded.get("uid")
     if not uid:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token without uid")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Não foi possível confirmar seu acesso. Entre novamente.")
     email = decoded.get("email")
     name = decoded.get("name") or email
     existing = await repo.fetch_person_by_firebase_uid(db, uid)
@@ -152,7 +152,7 @@ async def select_profile_for_person(
 ) -> TokenPairResponse:
     profile_row = await repo.get_profile_for_person(db, person_id, profile_id)
     if not profile_row:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Profile does not belong to this person")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Este perfil não pertence ao seu usuário.")
 
     session, raw_refresh, access = await _create_session_and_access(
         db,
@@ -209,13 +209,13 @@ async def switch_session_active_profile(
     )
     sess = res.scalar_one_or_none()
     if sess is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session not found")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sessão não encontrada. Entre novamente.")
     if sess.expires_at <= now:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session expired")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sua sessão expirou. Entre novamente.")
 
     profile_row = await repo.get_profile_for_person(db, person_id, new_profile_id)
     if not profile_row:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Profile does not belong to this person")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Este perfil não pertence ao seu usuário.")
 
     sess.active_profile_id = new_profile_id
     sess.last_used_at = now
@@ -256,7 +256,7 @@ async def create_auth_session(
     profiles = _rows_to_profiles(rows)
     profile_row = await repo.get_profile_for_person(db, person_id, profile_id)
     if not profile_row:
-        raise HTTPException(status.HTTP_403_FORBIDDEN, "Profile does not belong to this person")
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Este perfil não pertence ao seu usuário.")
 
     session, raw_refresh, access = await _create_session_and_access(
         db,
@@ -303,7 +303,7 @@ async def refresh_tokens(db: AsyncSession, refresh_token: str) -> TokenPairRespo
     )
     sess = res.scalar_one_or_none()
     if sess is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid refresh token")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sua sessão expirou. Entre novamente.")
 
     profile_row = await repo.get_profile_for_person(db, sess.person_id, sess.active_profile_id)
     if not profile_row:

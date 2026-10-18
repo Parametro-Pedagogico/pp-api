@@ -369,7 +369,7 @@ async def get_assessment_v1(
         {"id": str(assessment_id)},
     )
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assessment not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Avaliação não encontrada.")
     if not sscope["is_admin_like"]:
         in_scope = await _assessment_in_school_scope(
             db,
@@ -781,10 +781,10 @@ async def _student_assessment_summary_rows(
         {"id": str(student_id)},
     )
     if not prow:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Aluno não encontrado.")
     role_txt = (prow.get("role") or "").lower()
     if "student" not in role_txt:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Aluno não encontrado.")
     sscope = await get_effective_school_scope(db, ctx)
     pschool = prow.get("school_id")
     if pschool and str(pschool) in {str(x) for x in (sscope["effective_school_ids"] or [])}:
@@ -1087,14 +1087,14 @@ async def create_schedule_v1(
         {"id": str(body.assessment_id)},
     )
     if not assessment_row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assessment not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Avaliação não encontrada.")
     classroom_row = await fetch_one(
         db,
         "SELECT id, school_id FROM classrooms WHERE id = CAST(:id AS uuid)",
         {"id": str(body.classroom_id)},
     )
     if not classroom_row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Classroom not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada.")
     if _norm_role(ctx.role) == "school_admin":
         sscope = await get_effective_school_scope(db, ctx)
         if str(classroom_row["school_id"]) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
@@ -1179,7 +1179,7 @@ async def get_schedule_v1(
         {"id": str(schedule_id), "ay": str(effective_ay)},
     )
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Schedule not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Agendamento não encontrado.")
     if not cscope["is_admin_like"] and str(row["classroom_id"]) not in {
         str(x) for x in (cscope["effective_classroom_ids"] or [])
     }:
@@ -1435,7 +1435,7 @@ async def patch_schedule_v1(
             {"id": str(body["classroom_id"])},
         )
         if not classroom_row:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Classroom not found")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada.")
         assessment_row = await fetch_one(
             db,
             "SELECT id, school_id FROM assessments WHERE id = CAST(:id AS uuid)",

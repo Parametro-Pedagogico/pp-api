@@ -52,7 +52,7 @@ async def get_me_active_profile_v1(
 ):
     prof = await repo.get_profile_for_person(db, ctx.person_id, ctx.active_profile_id)
     if not prof:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Active profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil ativo não encontrado. Entre novamente.")
     return ProfileOut(
         id=prof["id"],
         full_name=prof.get("full_name"),

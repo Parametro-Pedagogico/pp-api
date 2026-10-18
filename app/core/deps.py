@@ -28,15 +28,15 @@ async def get_auth_context(
     db: Annotated[AsyncSession, Depends(get_db)],
 ) -> AuthContext:
     if creds is None or creds.scheme.lower() != "bearer":
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Missing bearer token")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Você precisa entrar para continuar.")
 
     try:
         payload = decode_access_token(creds.credentials)
     except Exception as exc:  # noqa: BLE001 — PyJWT errors
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token") from exc
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sessão inválida. Entre novamente.") from exc
 
     if payload.get("typ") != "access":
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid token type")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sessão inválida. Entre novamente.")
 
     from datetime import datetime, timezone
 
@@ -44,16 +44,16 @@ async def get_auth_context(
     res = await db.execute(select(AppSession).where(AppSession.id == sid, AppSession.revoked_at.is_(None)))
     row = res.scalar_one_or_none()
     if row is None:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session revoked or unknown")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sua sessão foi encerrada. Entre novamente.")
 
     now = datetime.now(timezone.utc)
     if row.expires_at <= now:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Session expired")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sua sessão expirou. Entre novamente.")
 
     pid = UUID(payload["sub"])
     prf = UUID(payload["prf"])
     if row.person_id != pid or row.active_profile_id != prf:
-        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Token does not match session")
+        raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Sessão inválida. Entre novamente.")
 
     return AuthContext(
         session_id=sid,

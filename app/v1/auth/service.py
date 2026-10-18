@@ -48,7 +48,7 @@ async def firebase_exchange_v1(db: AsyncSession, id_token: str) -> FirebaseExcha
     person_id = await ensure_person_from_firebase(db, decoded)
     prow = await repo.get_person_row(db, person_id)
     if not prow:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Person row missing after upsert")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Não foi possível registrar o usuário. Tente novamente.")
     rows = await repo.list_profiles_for_person(db, person_id)
     profiles = [
         ProfileOut(
@@ -104,7 +104,7 @@ async def select_profile_v1(
         try:
             person_id = decode_bootstrap_token(bootstrap_token)
         except Exception as exc:  # noqa: BLE001
-            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "Invalid or expired bootstrap_token") from exc
+            raise HTTPException(status.HTTP_401_UNAUTHORIZED, "O tempo para escolher o perfil acabou. Entre novamente.") from exc
     elif id_token:
         decoded = verify_firebase_id_token(id_token)
         person_id = await ensure_person_from_firebase(db, decoded)
@@ -124,7 +124,7 @@ async def select_profile_v1(
     )
     prof_row = await repo.get_profile_for_person(db, person_id, profile_id)
     if not prof_row:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Profile missing after session create")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Não foi possível abrir a sessão. Tente novamente.")
     active = ProfileOut(
         id=prof_row["id"],
         full_name=prof_row.get("full_name"),
@@ -162,10 +162,10 @@ async def refresh_v1(db: AsyncSession, refresh_token: str) -> TokenPairResponseV
 async def me_v1(db: AsyncSession, person_id: UUID, active_profile_id: UUID) -> MeResponseV1:
     person = await repo.get_person_row(db, person_id)
     if not person:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Person not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
     prof = await repo.get_profile_for_person(db, person_id, active_profile_id)
     if not prof:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Active profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil ativo não encontrado. Entre novamente.")
     active = ProfileOut(
         id=prof["id"],
         full_name=prof.get("full_name"),

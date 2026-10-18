@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request, status
+from fastapi.encoders import jsonable_encoder
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
@@ -194,7 +195,7 @@ async def health(
 @app.exception_handler(HTTPException)
 async def handle_http_exception(_: Request, exc: HTTPException):
     detail = exc.detail
-    message = detail if isinstance(detail, str) else "Request failed"
+    message = detail if isinstance(detail, str) else "Não foi possível concluir a solicitação."
     return JSONResponse(
         status_code=exc.status_code,
         content={
@@ -208,16 +209,33 @@ async def handle_http_exception(_: Request, exc: HTTPException):
     )
 
 
+def _campos_invalidos(errors: list) -> list[str]:
+    """Nomes dos campos com problema (sem o prefixo body/query), para a mensagem ao usuário."""
+    campos: list[str] = []
+    for err in errors:
+        loc = [str(p) for p in err.get("loc", ()) if p not in ("body", "query", "path", "header")]
+        nome = ".".join(loc)
+        if nome and nome not in campos:
+            campos.append(nome)
+    return campos
+
+
 @app.exception_handler(RequestValidationError)
 async def handle_validation_exception(_: Request, exc: RequestValidationError):
+    errors = exc.errors()
+    campos = _campos_invalidos(errors)
+    message = "Alguns dados estão incompletos ou inválidos."
+    if campos:
+        message += " Confira: " + ", ".join(campos) + "."
     return JSONResponse(
         status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
         content={
             "error": {
                 "code": 422,
                 "type": "validation_error",
-                "message": "Invalid request payload or params",
-                "detail": exc.errors(),
+                "message": message,
+                "fields": campos,
+                "detail": jsonable_encoder(errors),
             }
         },
     )
@@ -237,7 +255,7 @@ async def handle_unexpected_exception(_: Request, exc: Exception):
                 }
             },
         )
-    msg = str(exc) if settings.api_debug else "Unexpected internal error"
+    msg = str(exc) if settings.api_debug else "Ocorreu um erro inesperado. Tente novamente em instantes."
     return JSONResponse(
         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
         content={"error": {"code": 500, "type": "internal_error", "message": msg}},

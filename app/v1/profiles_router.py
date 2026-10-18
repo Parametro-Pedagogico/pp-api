@@ -25,7 +25,7 @@ async def get_profile_v1(
 ):
     row = await repo.get_profile_for_person(db, ctx.person_id, profile_id)
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil não encontrado.")
     return ProfileOut(
         id=row["id"],
         full_name=row.get("full_name"),
@@ -47,15 +47,15 @@ async def patch_profile_metadata_v1(
 ):
     row = await repo.get_profile_for_person(db, ctx.person_id, profile_id)
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil não encontrado.")
     pid = row.get("person_id")
     if not pid:
-        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Profile without person_id")
+        raise HTTPException(status.HTTP_400_BAD_REQUEST, "Perfil sem usuário vinculado.")
     await repo.update_person_metadata(db, pid, body.metadata)
     await db.commit()
     row2 = await repo.get_profile_for_person(db, ctx.person_id, profile_id)
     if not row2:
-        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Profile disappeared after update")
+        raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Não foi possível confirmar a atualização do perfil. Tente novamente.")
     return ProfileOut(
         id=row2["id"],
         full_name=row2.get("full_name"),

@@ -42,7 +42,7 @@ async def _fetch_classroom_scoped(
         {"id": str(classroom_id), "ay": str(effective_ay)},
     )
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Classroom not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada.")
     if not cscope["is_admin_like"] and str(row["id"]) not in {str(x) for x in cscope["effective_classroom_ids"]}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
     return row
@@ -61,7 +61,7 @@ async def _fetch_classroom_by_id_scoped(
         {"id": str(classroom_id)},
     )
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Classroom not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada.")
     if not cscope["is_admin_like"] and str(row["id"]) not in {str(x) for x in cscope["effective_classroom_ids"]}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
     return row
@@ -194,7 +194,7 @@ async def get_school_v1(
     scope = await get_effective_school_scope(db, ctx)
     row = await fetch_one(db, "SELECT * FROM schools WHERE id = CAST(:id AS uuid)", {"id": str(school_id)})
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "School not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Escola não encontrada.")
     if not scope["is_admin_like"] and str(row["id"]) not in {str(x) for x in scope["effective_school_ids"]}:
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
     return row

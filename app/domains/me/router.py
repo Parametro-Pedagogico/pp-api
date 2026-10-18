@@ -34,11 +34,11 @@ async def get_me(
 ):
     person = await repo.get_person_row(db, ctx.person_id)
     if not person:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Person not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
 
     prof = await repo.get_profile_for_person(db, ctx.person_id, ctx.active_profile_id)
     if not prof:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Active profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil ativo não encontrado. Entre novamente.")
 
     active = ProfileOut(
         id=prof["id"],
@@ -93,7 +93,7 @@ async def get_me_active_profile(
 ):
     prof = await repo.get_profile_for_person(db, ctx.person_id, ctx.active_profile_id)
     if not prof:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Active profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil ativo não encontrado. Entre novamente.")
 
     return ProfileOut(
         id=prof["id"],

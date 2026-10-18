@@ -107,7 +107,7 @@ async def _assert_school_id_in_scope(
 async def _student_scope_read(db: AsyncSession, ctx: AuthContext, student_id: UUID) -> dict[str, Any]:
     row = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(student_id)})
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Aluno não encontrado.")
     if is_admin_like(ctx.role):
         return row
     if str(row.get("person_id")) == str(ctx.person_id):
@@ -430,7 +430,7 @@ async def get_user_v1(
 ):
     row = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(user_id)})
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "User/profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
     await _assert_user_row_readable(db, ctx, row)
     return row
 
@@ -445,7 +445,7 @@ async def patch_user_v1(
     _assert_admin(ctx)
     row = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(user_id)})
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "User/profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
     sets_people = []
     p_params: dict[str, Any] = {"pid": str(row["person_id"])}
     if body.full_name is not None:
@@ -516,7 +516,7 @@ async def delete_user_v1(
         {"id": str(user_id)},
     )
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "User/profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
     await execute(db, "DELETE FROM profiles WHERE id = CAST(:id AS uuid)", {"id": str(user_id)})
     still = await fetch_one(
         db,
@@ -549,7 +549,7 @@ async def patch_user_email_v1(
         {"id": str(user_id)},
     )
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "User/profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
     await execute(
         db,
         "UPDATE people SET email = :email, date_updated = now() WHERE id = CAST(:pid AS uuid)",
@@ -583,7 +583,7 @@ async def post_user_password_reset_v1(
         {"id": str(user_id)},
     )
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "User/profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
     if not row.get("firebase_uid"):
         raise HTTPException(status.HTTP_409_CONFLICT, "Usuário sem firebase_uid")
     ensure_firebase_initialized()
@@ -620,7 +620,7 @@ async def sync_user_firebase_v1(
         {"id": str(user_id)},
     )
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "User/profile not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
     existing_uid = row.get("firebase_uid")
     if existing_uid:
         return {
@@ -918,7 +918,7 @@ async def list_student_classrooms_v1(
 ):
     row = await _student_scope_read(db, ctx, student_id)
     if "student" not in str(row.get("role") or "").lower():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Aluno não encontrado.")
     effective_ay = await resolve_academic_year_id(db, academic_year_id)
     params: dict[str, Any] = {"sid": str(student_id), "ay": str(effective_ay)}
     sql = """
@@ -1018,7 +1018,7 @@ async def teachers_eligible_v1(
         {"id": str(classroom_id)},
     )
     if not c:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Classroom not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada.")
     sid = c["school_id"]
     sscope = await get_effective_school_scope(db, ctx)
     if not sscope["is_admin_like"] and str(sid) not in {str(x) for x in (sscope["effective_school_ids"] or [])}:
@@ -1049,7 +1049,7 @@ async def get_teacher_v1(
 ):
     row = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(teacher_id)})
     if not row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Teacher not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Professor não encontrado.")
     if is_admin_like(ctx.role):
         return row
     if str(teacher_id) == str(ctx.active_profile_id):

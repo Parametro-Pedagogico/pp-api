@@ -40,7 +40,7 @@ async def assert_can_access_assessment_report_student(
             {"id": str(student_id)},
         )
         if not prow:
-            raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+            raise HTTPException(status.HTTP_404_NOT_FOUND, "Aluno não encontrado.")
         sscope = await get_effective_school_scope(db, ctx)
         pschool = prow.get("school_id")
         if pschool and str(pschool) in {str(x) for x in (sscope["effective_school_ids"] or [])}:
@@ -74,7 +74,7 @@ async def assert_can_access_assessment_report_student(
         {"id": str(student_id)},
     )
     if not prow:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Aluno não encontrado.")
     sscope = await get_effective_school_scope(db, ctx)
     pschool = prow.get("school_id")
     if pschool and str(pschool) in {str(x) for x in (sscope["effective_school_ids"] or [])}:
@@ -257,11 +257,11 @@ async def student_assessment_worksheet_bundle(
     ar_sql += " LIMIT 1"
     ar_row = await fetch_one(db, ar_sql, params)
     if not ar_row:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Assessment result not found for this year/context")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Resultado não encontrado para este ano letivo.")
 
     prof = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(student_id)})
     if not prof:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Aluno não encontrado.")
 
     cid = ar_row.get("classroom_id") or ar_row.get("classroom_uuid")
     answers_params: dict[str, Any] = {
@@ -1205,7 +1205,7 @@ async def assert_can_read_schedule_report(
         {"sid": str(schedule_id), "ay": str(academic_year_id)},
     )
     if not row or not row.get("classroom_id"):
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Schedule not found for this academic year")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Agendamento não encontrado neste ano letivo.")
     await assert_actor_can_read_classroom(db, ctx, UUID(str(row["classroom_id"])))
 
 
@@ -1254,7 +1254,7 @@ async def assessment_schedule_report_bundle(
         {"sid": str(schedule_id), "ay": str(academic_year_id)},
     )
     if not sched:
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Schedule not found for this academic year")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Agendamento não encontrado neste ano letivo.")
 
     classroom_id = sched.get("classroom_id")
     assessment_id = sched.get("assessment_id")

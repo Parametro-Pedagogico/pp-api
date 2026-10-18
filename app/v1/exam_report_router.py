@@ -1037,7 +1037,7 @@ async def report_classroom_v1(
             "[v1/reports/classrooms] classroom_id=%s not found (no row in classrooms)",
             classroom_id,
         )
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Classroom id not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Turma não encontrada.")
     if str(c_row.get("academic_year_id")) != str(effective_ay):
         logger.warning(
             "[v1/reports/classrooms] academic year mismatch classroom_id=%s classroom_ay=%s requested_ay=%s",
@@ -1216,7 +1216,7 @@ async def student_detail_v1(
     """Perfil + resumos de avaliação no ano letivo. Escopo alinhado a GET /v1/students/{id} (escola/pessoa)."""
     prof = await _student_scope_read(db, ctx, student_id)
     if "student" not in str(prof.get("role") or "").lower():
-        raise HTTPException(status.HTTP_404_NOT_FOUND, "Student not found")
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "Aluno não encontrado.")
     effective_ay = await resolve_academic_year_id(db, academic_year_id)
     sums = await fetch_all(
         db,
