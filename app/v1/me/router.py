@@ -31,16 +31,7 @@ async def get_me_profiles_v1(
 ):
     rows = await repo.list_profiles_for_person(db, ctx.person_id)
     return [
-        ProfileOut(
-            id=r["id"],
-            full_name=r.get("full_name"),
-            email=r.get("email"),
-            role=str(r["role"]),
-            school_id=r.get("school_id"),
-            person_id=r.get("person_id"),
-            code=r.get("code"),
-            metadata=r.get("metadata"),
-        )
+        ProfileOut.from_row(r)
         for r in rows
     ]
 
@@ -53,16 +44,7 @@ async def get_me_active_profile_v1(
     prof = await repo.get_profile_for_person(db, ctx.person_id, ctx.active_profile_id)
     if not prof:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil ativo não encontrado. Entre novamente.")
-    return ProfileOut(
-        id=prof["id"],
-        full_name=prof.get("full_name"),
-        email=prof.get("email"),
-        role=str(prof["role"]),
-        school_id=prof.get("school_id"),
-        person_id=prof.get("person_id"),
-        code=prof.get("code"),
-        metadata=prof.get("metadata"),
-    )
+    return ProfileOut.from_row(prof)
 
 
 @router.patch("/active-profile", response_model=PatchActiveProfileResponseV1)

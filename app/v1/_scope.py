@@ -31,15 +31,39 @@ def _norm_role(role: str) -> str:
     return (role or "").lower().replace("-", "_")
 
 
-def is_staff_admin_role(role: str) -> bool:
-    """Grosseiro: pode aceder a rotas só staff (KPI admin, diretório, …).
+def is_school_admin_like(role: str) -> bool:
+    """Gestor da escola inteira, com teto de escopo. `diretor` é o mesmo que `school_admin`.
 
-    Diferente de [is_admin_like]: `school_admin` não é «admin global» para SQL sem
+    (Fase 2) Por decisão da matriz de perfis, o diretor tem a mesma visão do gestor escolar;
+    o backend o trata exatamente como `school_admin` em escopo e autorização.
+    """
+    return _norm_role(role) in ("school_admin", "diretor")
+
+
+# (Fase 2) Perfis que enxergam dados da escola/rede com teto de escopo, mas em modo LEITURA:
+# coordenador (escola), técnico da secretaria e secretário (rede). O que cada um vê é limitado
+# pelo menu (role_module_access); a escrita continua restrita a [is_staff_admin_role].
+_SCHOOL_SCOPED_READERS = ("coordenador", "tecnico_secretaria", "secretario")
+
+
+def is_school_scoped_reader(role: str) -> bool:
+    return _norm_role(role) in _SCHOOL_SCOPED_READERS
+
+
+def is_staff_admin_role(role: str) -> bool:
+    """Grosseiro: pode aceder a rotas só staff (KPI admin, diretório, …) e ESCREVER no escopo.
+
+    Diferente de [is_admin_like]: `school_admin`/`diretor` não são «admin global» para SQL sem
     filtro de escola — [get_effective_school_scope] continua a aplicar hierarquia.
     """
     if is_admin_like(role):
         return True
-    return _norm_role(role) in ("platform_admin", "school_admin")
+    return _norm_role(role) == "platform_admin" or is_school_admin_like(role)
+
+
+def can_read_school_scope(role: str) -> bool:
+    """Pode LER dados da escola/rede dentro do seu escopo (staff admin + leitores com teto)."""
+    return is_staff_admin_role(role) or is_school_scoped_reader(role)
 
 
 async def resolve_admin_dashboard_school_ids(
@@ -52,14 +76,16 @@ async def resolve_admin_dashboard_school_ids(
     - `None`: sem filtro (todas as escolas) — só legacy admin / `platform_admin`.
     - Lista: raiz pedida + descendentes (intersecta com o escopo do `school_admin`).
     """
-    if not is_staff_admin_role(ctx.role):
+    if not can_read_school_scope(ctx.role):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
     r = _norm_role(ctx.role)
     if is_admin_like(ctx.role) or r == "platform_admin":
         if school_id is None:
             return None
         return await get_descendant_school_ids(db, school_id)
-    if r == "school_admin":
+    # school_admin, diretor (= school_admin) e leitores com teto (coordenador/técnico/secretário):
+    # ficam limitados à subárvore do nó do próprio perfil.
+    if is_school_admin_like(ctx.role) or is_school_scoped_reader(ctx.role):
         scope = await get_effective_school_scope(db, ctx)
         allowed = list(scope.get("effective_school_ids") or [])
         if not allowed:
@@ -86,7 +112,7 @@ def resolve_bot_audience(role: str) -> str:
     r = _norm_role(role)
     if is_admin_like(role):
         return "platform_admin"
-    if r == "school_admin":
+    if is_school_admin_like(role) or is_school_scoped_reader(role):
         return "school_admin"
     if "student" in r or r == "aluno":
         return "student"

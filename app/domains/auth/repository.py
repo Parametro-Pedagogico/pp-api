@@ -83,16 +83,21 @@ async def update_person_firebase_link(
 async def list_profiles_for_person(db: AsyncSession, person_id: UUID) -> list[dict]:
     q = text(
         """
-        SELECT id, full_name, email,
-               effective_role AS role,
-               role AS legacy_role,
-               role_definition_id,
-               role_definition_code,
-               role_definition_name,
-               school_id, person_id, code, metadata
-        FROM vw_profiles
-        WHERE person_id = :pid
-        ORDER BY created_at NULLS LAST
+        SELECT p.id, p.full_name, p.email,
+               p.effective_role AS role,
+               p.role AS legacy_role,
+               p.role_definition_id,
+               p.role_definition_code,
+               p.role_definition_name,
+               rd.scope_type AS scope_type,
+               p.school_id, p.person_id, p.code, p.metadata,
+               s.type::text AS school_type,
+               s.name AS school_name
+        FROM vw_profiles p
+        LEFT JOIN role_definitions rd ON rd.id = p.role_definition_id
+        LEFT JOIN schools s ON s.id = p.school_id
+        WHERE p.person_id = :pid
+        ORDER BY p.created_at NULLS LAST
         """
     )
     rows = (await db.execute(q, {"pid": person_id})).mappings().all()
@@ -102,15 +107,20 @@ async def list_profiles_for_person(db: AsyncSession, person_id: UUID) -> list[di
 async def get_profile_for_person(db: AsyncSession, person_id: UUID, profile_id: UUID) -> dict | None:
     q = text(
         """
-        SELECT id, full_name, email,
-               effective_role AS role,
-               role AS legacy_role,
-               role_definition_id,
-               role_definition_code,
-               role_definition_name,
-               school_id, person_id, code, metadata
-        FROM vw_profiles
-        WHERE person_id = :pid AND id = :prid
+        SELECT p.id, p.full_name, p.email,
+               p.effective_role AS role,
+               p.role AS legacy_role,
+               p.role_definition_id,
+               p.role_definition_code,
+               p.role_definition_name,
+               rd.scope_type AS scope_type,
+               p.school_id, p.person_id, p.code, p.metadata,
+               s.type::text AS school_type,
+               s.name AS school_name
+        FROM vw_profiles p
+        LEFT JOIN role_definitions rd ON rd.id = p.role_definition_id
+        LEFT JOIN schools s ON s.id = p.school_id
+        WHERE p.person_id = :pid AND p.id = :prid
         LIMIT 1
         """
     )

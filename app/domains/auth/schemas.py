@@ -33,6 +33,29 @@ class ProfileOut(BaseModel):
     person_id: UUID | None = None
     code: str | None = None
     metadata: dict[str, Any] | list[Any] | str | None = None
+    # (Fase 2) Dão ao frontend o papel e o escopo sem adivinhar por grafia:
+    role_definition_code: str | None = None  # código canônico do papel (ex.: "diretor", "coordenador")
+    scope_type: str | None = None  # platform | school | classroom | self
+    school_type: str | None = None  # tipo do nó de escopo: unidade, rede ou secretaria
+    school_name: str | None = None  # nome do nó de escopo
+
+    @classmethod
+    def from_row(cls, prof: dict[str, Any]) -> "ProfileOut":
+        """Monta a partir de uma linha de `vw_profiles` enriquecida (ver repository.py)."""
+        return cls(
+            id=prof["id"],
+            full_name=prof.get("full_name"),
+            email=prof.get("email"),
+            role=str(prof["role"]),
+            school_id=prof.get("school_id"),
+            person_id=prof.get("person_id"),
+            code=prof.get("code"),
+            metadata=prof.get("metadata"),
+            role_definition_code=prof.get("role_definition_code"),
+            scope_type=prof.get("scope_type"),
+            school_type=prof.get("school_type"),
+            school_name=prof.get("school_name"),
+        )
 
 
 class FirebaseExchangeResponse(BaseModel):

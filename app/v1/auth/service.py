@@ -50,19 +50,7 @@ async def firebase_exchange_v1(db: AsyncSession, id_token: str) -> FirebaseExcha
     if not prow:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Não foi possível registrar o usuário. Tente novamente.")
     rows = await repo.list_profiles_for_person(db, person_id)
-    profiles = [
-        ProfileOut(
-            id=r["id"],
-            full_name=r.get("full_name"),
-            email=r.get("email"),
-            role=str(r["role"]),
-            school_id=r.get("school_id"),
-            person_id=r.get("person_id"),
-            code=r.get("code"),
-            metadata=r.get("metadata"),
-        )
-        for r in rows
-    ]
+    profiles = [ProfileOut.from_row(r) for r in rows]
     await db.commit()
     must = len(profiles) > 1
     bt = create_bootstrap_token(person_id=person_id)
@@ -125,16 +113,7 @@ async def select_profile_v1(
     prof_row = await repo.get_profile_for_person(db, person_id, profile_id)
     if not prof_row:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Não foi possível abrir a sessão. Tente novamente.")
-    active = ProfileOut(
-        id=prof_row["id"],
-        full_name=prof_row.get("full_name"),
-        email=prof_row.get("email"),
-        role=str(prof_row["role"]),
-        school_id=prof_row.get("school_id"),
-        person_id=prof_row.get("person_id"),
-        code=prof_row.get("code"),
-        metadata=prof_row.get("metadata"),
-    )
+    active = ProfileOut.from_row(prof_row)
     ctx = AuthContextResponseV1(
         person_id=person_id,
         active_profile_id=profile_id,
@@ -166,16 +145,7 @@ async def me_v1(db: AsyncSession, person_id: UUID, active_profile_id: UUID) -> M
     prof = await repo.get_profile_for_person(db, person_id, active_profile_id)
     if not prof:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil ativo não encontrado. Entre novamente.")
-    active = ProfileOut(
-        id=prof["id"],
-        full_name=prof.get("full_name"),
-        email=prof.get("email"),
-        role=str(prof["role"]),
-        school_id=prof.get("school_id"),
-        person_id=prof.get("person_id"),
-        code=prof.get("code"),
-        metadata=prof.get("metadata"),
-    )
+    active = ProfileOut.from_row(prof)
     ctx = SessionContextOut(
         person_id=person_id,
         active_profile_id=active_profile_id,

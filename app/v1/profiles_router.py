@@ -26,16 +26,7 @@ async def get_profile_v1(
     row = await repo.get_profile_for_person(db, ctx.person_id, profile_id)
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Perfil não encontrado.")
-    return ProfileOut(
-        id=row["id"],
-        full_name=row.get("full_name"),
-        email=row.get("email"),
-        role=str(row["role"]),
-        school_id=row.get("school_id"),
-        person_id=row.get("person_id"),
-        code=row.get("code"),
-        metadata=row.get("metadata"),
-    )
+    return ProfileOut.from_row(row)
 
 
 @router.patch("/{profile_id}/metadata", response_model=ProfileOut)
@@ -56,13 +47,4 @@ async def patch_profile_metadata_v1(
     row2 = await repo.get_profile_for_person(db, ctx.person_id, profile_id)
     if not row2:
         raise HTTPException(status.HTTP_500_INTERNAL_SERVER_ERROR, "Não foi possível confirmar a atualização do perfil. Tente novamente.")
-    return ProfileOut(
-        id=row2["id"],
-        full_name=row2.get("full_name"),
-        email=row2.get("email"),
-        role=str(row2["role"]),
-        school_id=row2.get("school_id"),
-        person_id=row2.get("person_id"),
-        code=row2.get("code"),
-        metadata=row2.get("metadata"),
-    )
+    return ProfileOut.from_row(row2)
