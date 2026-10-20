@@ -50,6 +50,17 @@ def is_school_scoped_reader(role: str) -> bool:
     return _norm_role(role) in _SCHOOL_SCOPED_READERS
 
 
+# (Fase 2) Papéis que podem LANÇAR presença (e enviar listas/cartões digitalizados) das turmas
+# dentro do seu escopo: coordenador (na escola) e técnico da secretaria (na rede). O secretário é
+# só leitura e NÃO entra aqui. Professores e staff são tratados à parte no router de aplicações.
+def is_tecnico_secretaria(role: str) -> bool:
+    return _norm_role(role) in ("tecnico_secretaria", "tecnico_rede")
+
+
+def is_presence_editor_role(role: str) -> bool:
+    return _norm_role(role) == "coordenador" or is_tecnico_secretaria(role)
+
+
 def is_staff_admin_role(role: str) -> bool:
     """Grosseiro: pode aceder a rotas só staff (KPI admin, diretório, …) e ESCREVER no escopo.
 

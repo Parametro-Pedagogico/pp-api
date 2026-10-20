@@ -105,3 +105,20 @@ async def test_coordenador_sem_escola_recebe_403(monkeypatch):
     with pytest.raises(HTTPException) as exc:
         await _scope.resolve_admin_dashboard_school_ids(object(), ctx, None)
     assert exc.value.status_code == 403
+
+
+def test_presence_editor_roles():
+    assert _scope.is_presence_editor_role("coordenador")
+    assert _scope.is_presence_editor_role("tecnico_secretaria")
+    assert _scope.is_presence_editor_role("tecnico-rede")
+    # Secretário é só leitura; staff/professor tratados à parte no router.
+    assert not _scope.is_presence_editor_role("secretario")
+    assert not _scope.is_presence_editor_role("teacher")
+    assert not _scope.is_presence_editor_role("school_admin")
+
+
+def test_is_tecnico_secretaria_aceita_aliases():
+    assert _scope.is_tecnico_secretaria("tecnico_secretaria")
+    assert _scope.is_tecnico_secretaria("TECNICO_SECRETARIA")
+    assert _scope.is_tecnico_secretaria("tecnico-rede")
+    assert not _scope.is_tecnico_secretaria("secretario")

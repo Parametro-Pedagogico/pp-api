@@ -63,6 +63,17 @@ async def _school_bot_enabled(db: AsyncSession, school_id: UUID | None) -> bool:
     return bool(row and row.get("bot_enabled"))
 
 
+async def _school_network_user_mgmt_enabled(db: AsyncSession, school_id: UUID | None) -> bool:
+    if not school_id:
+        return False
+    row = await fetch_one(
+        db,
+        "SELECT network_user_management_enabled FROM schools WHERE id = CAST(:id AS uuid)",
+        {"id": str(school_id)},
+    )
+    return bool(row and row.get("network_user_management_enabled"))
+
+
 async def _feature_flag_enabled(
     db: AsyncSession,
     flag: str | None,
@@ -72,6 +83,9 @@ async def _feature_flag_enabled(
 ) -> bool:
     if not flag:
         return True
+    if flag == "network_user_management":
+        # (Fase 2) Item "Usuários" do técnico da secretaria, liberado por contrato no nó da rede.
+        return await _school_network_user_mgmt_enabled(db, school_view_id or ctx.school_id)
     if flag == "assistant_school_bot":
         school_id = school_view_id or ctx.school_id
         if is_platform_admin_role(ctx.role) and not school_view_id:

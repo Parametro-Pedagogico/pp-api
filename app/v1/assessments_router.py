@@ -23,6 +23,7 @@ from app.v1._scope import (
     get_effective_classroom_scope,
     get_effective_school_scope,
     is_admin_like,
+    is_presence_editor_role,
     is_staff_admin_role,
 )
 from app.domains.rbac.module_access_service import (
@@ -166,6 +167,22 @@ def _shape_assessment_schedule_list_item(row: dict[str, Any]) -> dict[str, Any]:
     return r
 
 
+async def _classroom_in_school_scope(db: AsyncSession, ctx: AuthContext, classroom_id: UUID) -> bool:
+    """A turma pertence a uma escola dentro do escopo efetivo do perfil (subárvore do nó)."""
+    sscope = await get_effective_school_scope(db, ctx)
+    if sscope["is_admin_like"]:
+        return True
+    allowed = {str(x) for x in (sscope["effective_school_ids"] or [])}
+    if not allowed:
+        return False
+    row = await fetch_one(
+        db,
+        "SELECT school_id FROM classrooms WHERE id = CAST(:cid AS uuid)",
+        {"cid": str(classroom_id)},
+    )
+    return bool(row and row.get("school_id") is not None and str(row["school_id"]) in allowed)
+
+
 async def _schedule_teacher_can_manage(db: AsyncSession, ctx: AuthContext, classroom_id: UUID) -> bool:
     if is_staff_admin_role(ctx.role):
         return True
@@ -178,7 +195,13 @@ async def _schedule_teacher_can_manage(db: AsyncSession, ctx: AuthContext, class
         """,
         {"cid": str(classroom_id), "tid": str(ctx.active_profile_id)},
     )
-    return row is not None
+    if row is not None:
+        return True
+    # (Fase 2) Coordenador (na escola) e técnico da secretaria (na rede) lançam presença e enviam
+    # listas/cartões das turmas dentro do seu escopo. Secretário é só leitura e não entra aqui.
+    if is_presence_editor_role(ctx.role):
+        return await _classroom_in_school_scope(db, ctx, classroom_id)
+    return False
 
 
 async def _assert_schedule_attendance_editor(db: AsyncSession, ctx: AuthContext, schedule_row: dict[str, Any]) -> None:

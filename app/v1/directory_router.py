@@ -22,6 +22,7 @@ from app.v1._scope import (
     get_effective_school_scope,
     is_admin_like,
     is_staff_admin_role,
+    is_tecnico_secretaria,
 )
 from app.v1._sql import execute, fetch_all, fetch_one
 from app.v1.user_import_jobs import (
@@ -126,6 +127,64 @@ def _assert_admin(ctx: AuthContext) -> None:
     """
     if not is_staff_admin_role(ctx.role):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+
+
+# ---- (Fase 2) Administração de usuários pelo técnico da secretaria, liberada por contrato ----
+# O administrador do sistema liga `schools.network_user_management_enabled` no nó da rede. Com a
+# flag ligada, o técnico administra usuários DENTRO da sua rede, sem poder atribuir papéis
+# privilegiados (admin/gestor) nem mover usuários para fora da rede.
+
+async def _tecnico_user_mgmt_enabled(db: AsyncSession, ctx: AuthContext) -> bool:
+    if not is_tecnico_secretaria(ctx.role) or not ctx.school_id:
+        return False
+    row = await fetch_one(
+        db,
+        "SELECT network_user_management_enabled AS on FROM schools WHERE id = CAST(:id AS uuid)",
+        {"id": str(ctx.school_id)},
+    )
+    return bool(row and row.get("on"))
+
+
+def _role_is_privileged(*values: object) -> bool:
+    """True se algum valor indicar papel de gestor/admin (o técnico não pode atribuir)."""
+    for v in values:
+        if v is None:
+            continue
+        r = str(v).strip().lower().replace("-", "_")
+        if is_admin_like(r) or r in ("school_admin", "diretor"):
+            return True
+    return False
+
+
+async def _assert_user_mgmt_gate(db: AsyncSession, ctx: AuthContext) -> bool:
+    """Porta das rotas de usuário.
+
+    Retorna True quando o ator é técnico com a flag (o chamador deve então validar escopo e
+    privilégio do alvo); False para staff administrativo (comportamento atual). Levanta 403 caso
+    contrário.
+    """
+    if is_staff_admin_role(ctx.role):
+        return False
+    if await _tecnico_user_mgmt_enabled(db, ctx):
+        return True
+    raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+
+
+async def _assert_tecnico_target_in_scope(
+    db: AsyncSession,
+    ctx: AuthContext,
+    *,
+    school_ids: list[object | None],
+    privileged_values: tuple[object, ...] = (),
+) -> None:
+    """Garante que o alvo está na rede do técnico e que nenhum papel privilegiado é tocado."""
+    sscope = await get_effective_school_scope(db, ctx)
+    allowed = {str(x) for x in (sscope.get("effective_school_ids") or [])}
+    for sid in school_ids:
+        if sid is None or str(sid) not in allowed:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Usuário fora da sua rede.")
+    if _role_is_privileged(*privileged_values):
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Você não pode atribuir ou alterar esse papel.")
 
 
 def _resolve_or_create_firebase_user(
@@ -398,7 +457,19 @@ async def create_user_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_admin(ctx)
+    tecnico = await _assert_user_mgmt_gate(db, ctx)
+    if tecnico:
+        priv: tuple[object, ...] = (body.role, body.code)
+        if body.role_definition_id is not None:
+            rd = await fetch_one(
+                db,
+                "SELECT code FROM role_definitions WHERE id = CAST(:id AS uuid)",
+                {"id": str(body.role_definition_id)},
+            )
+            priv = (body.role, rd.get("code") if rd else None)
+        await _assert_tecnico_target_in_scope(
+            db, ctx, school_ids=[body.school_id], privileged_values=priv
+        )
     return await _create_user_with_profile(db, body=body)
 
 
@@ -412,7 +483,8 @@ async def _assert_user_row_readable(
         return
     if is_admin_like(ctx.role):
         return
-    if not is_staff_admin_role(ctx.role):
+    # staff administrativo, ou técnico com a flag de contrato (ambos por escopo de escola abaixo).
+    if not is_staff_admin_role(ctx.role) and not await _tecnico_user_mgmt_enabled(db, ctx):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Fora do escopo")
     sscope = await get_effective_school_scope(db, ctx)
     eff = {str(x) for x in (sscope.get("effective_school_ids") or [])}
@@ -442,10 +514,19 @@ async def patch_user_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_admin(ctx)
+    tecnico = await _assert_user_mgmt_gate(db, ctx)
     row = await fetch_one(db, "SELECT * FROM vw_profiles WHERE id = CAST(:id AS uuid)", {"id": str(user_id)})
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
+    if tecnico:
+        if body.role is not None or body.role_definition_id is not None:
+            raise HTTPException(status.HTTP_403_FORBIDDEN, "Você não pode alterar o papel do usuário.")
+        await _assert_tecnico_target_in_scope(
+            db,
+            ctx,
+            school_ids=[row.get("school_id"), body.school_id] if body.school_id is not None else [row.get("school_id")],
+            privileged_values=(row.get("role"), row.get("role_definition_code")),
+        )
     sets_people = []
     p_params: dict[str, Any] = {"pid": str(row["person_id"])}
     if body.full_name is not None:
@@ -509,14 +590,21 @@ async def delete_user_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_admin(ctx)
+    tecnico = await _assert_user_mgmt_gate(db, ctx)
     row = await fetch_one(
         db,
-        "SELECT id, person_id, firebase_uid FROM vw_profiles WHERE id = CAST(:id AS uuid)",
+        "SELECT id, person_id, firebase_uid, school_id, role::text AS role, role_definition_code FROM vw_profiles WHERE id = CAST(:id AS uuid)",
         {"id": str(user_id)},
     )
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
+    if tecnico:
+        await _assert_tecnico_target_in_scope(
+            db,
+            ctx,
+            school_ids=[row.get("school_id")],
+            privileged_values=(row.get("role"), row.get("role_definition_code")),
+        )
     await execute(db, "DELETE FROM profiles WHERE id = CAST(:id AS uuid)", {"id": str(user_id)})
     still = await fetch_one(
         db,
@@ -542,14 +630,19 @@ async def patch_user_email_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_admin(ctx)
+    tecnico = await _assert_user_mgmt_gate(db, ctx)
     row = await fetch_one(
         db,
-        "SELECT person_id, firebase_uid FROM vw_profiles WHERE id = CAST(:id AS uuid)",
+        "SELECT person_id, firebase_uid, school_id, role::text AS role, role_definition_code FROM vw_profiles WHERE id = CAST(:id AS uuid)",
         {"id": str(user_id)},
     )
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
+    if tecnico:
+        await _assert_tecnico_target_in_scope(
+            db, ctx, school_ids=[row.get("school_id")],
+            privileged_values=(row.get("role"), row.get("role_definition_code")),
+        )
     await execute(
         db,
         "UPDATE people SET email = :email, date_updated = now() WHERE id = CAST(:pid AS uuid)",
@@ -576,14 +669,19 @@ async def post_user_password_reset_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
-    _assert_admin(ctx)
+    tecnico = await _assert_user_mgmt_gate(db, ctx)
     row = await fetch_one(
         db,
-        "SELECT email, firebase_uid FROM vw_profiles WHERE id = CAST(:id AS uuid)",
+        "SELECT email, firebase_uid, school_id, role::text AS role, role_definition_code FROM vw_profiles WHERE id = CAST(:id AS uuid)",
         {"id": str(user_id)},
     )
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
+    if tecnico:
+        await _assert_tecnico_target_in_scope(
+            db, ctx, school_ids=[row.get("school_id")],
+            privileged_values=(row.get("role"), row.get("role_definition_code")),
+        )
     if not row.get("firebase_uid"):
         raise HTTPException(status.HTTP_409_CONFLICT, "Usuário sem firebase_uid")
     ensure_firebase_initialized()
@@ -609,16 +707,22 @@ async def sync_user_firebase_v1(
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Integra pessoa ao Firebase: vincula por e-mail existente ou cria nova conta."""
-    _assert_admin(ctx)
+    tecnico = await _assert_user_mgmt_gate(db, ctx)
     row = await fetch_one(
         db,
         """
-        SELECT id, person_id, email, full_name, firebase_uid
+        SELECT id, person_id, email, full_name, firebase_uid, school_id,
+               role::text AS role, role_definition_code
         FROM vw_profiles
         WHERE id = CAST(:id AS uuid)
         """,
         {"id": str(user_id)},
     )
+    if row and tecnico:
+        await _assert_tecnico_target_in_scope(
+            db, ctx, school_ids=[row.get("school_id")],
+            privileged_values=(row.get("role"), row.get("role_definition_code")),
+        )
     if not row:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "Usuário não encontrado.")
     existing_uid = row.get("firebase_uid")
