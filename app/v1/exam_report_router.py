@@ -2322,6 +2322,71 @@ async def admin_kpi_v1(
     return out
 
 
+@router.get("/admin/dashboard/schools-comparison")
+async def admin_schools_comparison_v1(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+    academic_year_id: UUID | None = Query(None, description="Ano letivo. Se omitido, usa is_primary=true."),
+    school_id: UUID | None = Query(
+        None,
+        description="Raiz da rede/escola: compara as unidades da subárvore. Para gestão de rede, usa o escopo do perfil.",
+    ),
+):
+    """(Fase 3) Comparação entre escolas da rede: uma linha por unidade escolar da subárvore.
+
+    Pensado para o secretário e o técnico da secretaria (e plataforma). O escopo segue
+    [resolve_admin_dashboard_school_ids]: a lista fica limitada à subárvore do nó do perfil.
+    """
+    ay = await resolve_academic_year_id(db, academic_year_id)
+    school_ids: list[UUID] | None = await resolve_admin_dashboard_school_ids(db, ctx, school_id)
+
+    params: dict[str, Any] = {"ay": str(ay)}
+    scope_sql = ""
+    if school_ids is not None:
+        scope_sql = "AND s.id = ANY(CAST(:sids AS uuid[]))"
+        params["sids"] = [str(x) for x in school_ids]
+
+    rows = await fetch_all(
+        db,
+        f"""
+        SELECT
+          s.id::text AS school_id,
+          s.name AS school_name,
+          COUNT(DISTINCT c.id)::int AS classrooms,
+          COUNT(DISTINCT cs.student_id)::int AS students,
+          COUNT(DISTINCT ar.student_id)::int AS students_with_results,
+          COALESCE(ROUND(AVG(ar.score)::numeric, 1), 0)::float AS avg_score
+        FROM schools s
+        LEFT JOIN classrooms c
+          ON c.school_id = s.id AND c.academic_year_id = CAST(:ay AS uuid)
+        LEFT JOIN classroom_students cs ON cs.classroom_id = c.id
+        LEFT JOIN assessment_results ar
+          ON ar.classroom_id = c.id AND ar.score IS NOT NULL
+        WHERE s.type = 'school unit' {scope_sql}
+        GROUP BY s.id, s.name
+        ORDER BY s.name
+        """,
+        params,
+    )
+
+    items = []
+    for r in rows:
+        students = int(r.get("students") or 0)
+        with_results = int(r.get("students_with_results") or 0)
+        items.append(
+            {
+                "school_id": r.get("school_id"),
+                "school_name": r.get("school_name"),
+                "classrooms": int(r.get("classrooms") or 0),
+                "students": students,
+                "students_with_results": with_results,
+                "participation_rate": round(with_results / students * 100) if students else 0,
+                "avg_score": r.get("avg_score") or 0,
+            }
+        )
+    return {"academic_year_id": str(ay), "items": items}
+
+
 @router.get("/admin/dashboard/cockpit")
 async def admin_dashboard_cockpit_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
