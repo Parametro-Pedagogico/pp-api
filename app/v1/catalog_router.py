@@ -11,6 +11,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import AuthContext, get_auth_context
 from app.db.session import get_db
+from app.events.master_data import replicate_classroom, replicate_school
 from app.v1._academic_year import resolve_academic_year_id
 from app.v1._paging import PageArgs, paged_response, paged_response_with_academic_year, pagination_params
 from app.v1._scope import (
@@ -181,6 +182,7 @@ async def create_school_v1(
             "parent": str(body.parent) if body.parent else None,
         },
     )
+    await replicate_school(db, row)  # replicação do dado mestre (mesma transação)
     await db.commit()
     return row
 
@@ -233,6 +235,8 @@ async def patch_school_v1(
         return await get_school_v1(school_id, ctx, db)
     sql = f"UPDATE schools SET {', '.join(sets)} WHERE id = CAST(:id AS uuid) RETURNING *"
     row = await fetch_one(db, sql, params)
+    if row:
+        await replicate_school(db, row)  # replicação do dado mestre (mesma transação)
     await db.commit()
     return row
 
@@ -419,6 +423,7 @@ async def create_classroom_v1(
             "shift": body.shift,
         },
     )
+    await replicate_classroom(db, row)  # replicação do dado mestre (mesma transação)
     await db.commit()
     return row
 
@@ -474,6 +479,8 @@ async def patch_classroom_v1(
         return row
     sql = f"UPDATE classrooms SET {', '.join(sets)} WHERE id = CAST(:id AS uuid) RETURNING *"
     out = await fetch_one(db, sql, params)
+    if out:
+        await replicate_classroom(db, out)  # replicação do dado mestre (mesma transação)
     await db.commit()
     return out
 
