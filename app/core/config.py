@@ -154,6 +154,17 @@ class Settings(BaseSettings):
         description="db = bot_settings ativo; env = GROQ_API_KEY / ASSISTANT_OPENAI_* do .env",
     )
 
+    # --- Eventos / barramento (arquitetura de microsserviços) -------------------------------
+    service_name: str = Field(default="pp-api", description="Identidade do serviço no producer dos eventos.")
+    service_version: str = Field(default="0.1.0", description="Versão do serviço no producer dos eventos.")
+    gcp_project: str | None = Field(default=None, description="Projeto GCP dos tópicos Pub/Sub.")
+    pubsub_topic_replication: str = Field(default="replicacao", description="Tópico de replicação de dados mestres.")
+    pubsub_topic_results: str = Field(default="resultados", description="Tópico de eventos de resultado.")
+    events_publish_enabled: bool = Field(
+        default=False,
+        description="Liga o relay da outbox. Falso até os tópicos Pub/Sub existirem (ver docs/infra-gcp.md).",
+    )
+
     @model_validator(mode="after")
     def _validate_attendance_storage(self):
         if self.attendance_sheet_storage_backend == "gcs":
