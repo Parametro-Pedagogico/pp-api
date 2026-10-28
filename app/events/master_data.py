@@ -54,3 +54,18 @@ async def replicate_school(db: AsyncSession, row: dict[str, Any]) -> None:
 
 async def replicate_classroom(db: AsyncSession, row: dict[str, Any]) -> None:
     await publish_replication(db, "turmas", _shape(row, CLASSROOM_FIELDS))
+
+
+async def replicate_deletion(
+    db: AsyncSession, collection: str, record_id: Any, last_version: int
+) -> None:
+    """Tombstone: avisa o satélite para remover o registro.
+
+    `last_version` é a versão que o registro tinha antes de ser apagado; o tombstone usa a
+    próxima (`+1`) para ser mais novo que o último estado replicado (ordenação/idempotência).
+    """
+    await publish_replication(
+        db,
+        collection,
+        {"id": str(record_id), "version": int(last_version) + 1, "deleted": True},
+    )

@@ -2,6 +2,10 @@
 
 import uuid
 
+import pytest
+
+from app.events import master_data as md
+from app.events import replication as repl
 from app.events.master_data import CLASSROOM_FIELDS, SCHOOL_FIELDS, _shape
 
 
@@ -32,3 +36,23 @@ def test_classroom_shape_ignores_missing_fields():
     shaped = _shape(row, CLASSROOM_FIELDS)
     assert set(shaped) == {"id", "version", "name"}
     assert isinstance(shaped["id"], str)
+
+
+@pytest.mark.asyncio
+async def test_tombstone_bumps_version_and_flags_deleted(monkeypatch):
+    captured = {}
+
+    async def fake_enqueue(db, topic, envelope):
+        captured["topic"] = topic
+        captured["env"] = envelope
+
+    monkeypatch.setattr(repl, "enqueue", fake_enqueue)
+    await md.replicate_deletion(
+        db=None, collection="escolas", record_id="e1", last_version=5
+    )
+
+    env = captured["env"]
+    assert env.event_type == "replicacao.escolas"
+    assert env.idempotency_key == "escolas:e1:v6"  # última versão + 1
+    assert env.data["deleted"] is True
+    assert env.data["version"] == 6

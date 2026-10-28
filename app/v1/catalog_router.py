@@ -11,7 +11,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.core.deps import AuthContext, get_auth_context
 from app.db.session import get_db
-from app.events.master_data import replicate_classroom, replicate_school
+from app.events.master_data import (
+    replicate_classroom,
+    replicate_deletion,
+    replicate_school,
+)
 from app.v1._academic_year import resolve_academic_year_id
 from app.v1._paging import PageArgs, paged_response, paged_response_with_academic_year, pagination_params
 from app.v1._scope import (
@@ -256,7 +260,12 @@ async def delete_school_v1(
     )
     if kids:
         raise HTTPException(status.HTTP_409_CONFLICT, "Escola com filhos; remova ou mova antes.")
+    existing = await fetch_one(
+        db, "SELECT version FROM schools WHERE id = CAST(:id AS uuid)", {"id": str(school_id)}
+    )
     await execute(db, "DELETE FROM schools WHERE id = CAST(:id AS uuid)", {"id": str(school_id)})
+    if existing:
+        await replicate_deletion(db, "escolas", school_id, existing["version"])  # tombstone
     await db.commit()
     return {"ok": True}
 
@@ -494,7 +503,12 @@ async def delete_classroom_v1(
     await _fetch_classroom_by_id_scoped(db, ctx, classroom_id)
     if not is_admin_like(ctx.role):
         raise HTTPException(status.HTTP_403_FORBIDDEN, "Apenas administradores")
+    existing = await fetch_one(
+        db, "SELECT version FROM classrooms WHERE id = CAST(:id AS uuid)", {"id": str(classroom_id)}
+    )
     await execute(db, "DELETE FROM classrooms WHERE id = CAST(:id AS uuid)", {"id": str(classroom_id)})
+    if existing:
+        await replicate_deletion(db, "turmas", classroom_id, existing["version"])  # tombstone
     await db.commit()
     return {"ok": True}
 
