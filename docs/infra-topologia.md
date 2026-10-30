@@ -1,8 +1,9 @@
 # Topologia de implantação (decidida)
 
-Como o ecossistema roda em produção. Decidido com os sócios; os comandos de provisionamento estão em
-[`infra-gcp.md`](infra-gcp.md). Objetivo que guia tudo: **isolamento por serviço**, **custo ≈ zero quando
-ocioso** e **parar/implantar um serviço sem afetar os outros**.
+Como o ecossistema roda em produção. Decidido com os sócios; o passo a passo de provisionamento está no
+[**runbook**](infra-gcp-runbook.md) (conceitos em [`infra-gcp.md`](infra-gcp.md)). Objetivo que guia tudo:
+**isolamento por serviço**, **custo ≈ zero quando ocioso** e **parar/implantar um serviço sem afetar os
+outros**.
 
 ## Quem roda onde
 
@@ -64,7 +65,11 @@ Cada serviço tem a sua SA, com o **mínimo** necessário:
 6. Demais satélites, um a um. **Envio** entra por último (anexar SA à VM dele; trocar o CSV manual por
    evento), sem downtime para as escolas.
 
-## Decisão pendente
+## Decisões confirmadas
 
-- **Confirmar satélites = Cloud Run** (recomendado) × VM por satélite. O resto da topologia não muda.
-- Região do Cloud SQL e da VM: **São Paulo** (`southamerica-east1`), perto das escolas e do envio.
+- **Satélites em Cloud Run** (escala a zero, isolados, acordam no push). ✅
+- **Central em VM dedicada + Cloud SQL** (banco gerenciado, separado). ✅
+- Região do Cloud SQL e da VM: **São Paulo** (`southamerica-east1`), perto das escolas e do envio. ✅
+- **Envio intocado** nesta etapa.
+
+Provisionamento: ver o [runbook](infra-gcp-runbook.md).
