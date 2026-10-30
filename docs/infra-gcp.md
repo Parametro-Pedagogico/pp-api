@@ -89,7 +89,16 @@ GCP_PROJECT=seu-projeto
 EVENTS_PUBLISH_ENABLED=true
 PUBSUB_TOPIC_REPLICATION=replicacao
 PUBSUB_TOPIC_RESULTS=resultados
+
+# Segurança do endpoint de resultado (push): o central valida o OIDC da assinatura.
+# A audiência deve bater com a configurada na subscription resultados-central.
+PUBSUB_PUSH_AUDIENCE=https://<url-do-pp-api>/v1/events/resultado
+PUBSUB_PUSH_SERVICE_ACCOUNT=pubsub-push@seu-projeto.iam.gserviceaccount.com
 ```
+
+> Enquanto `PUBSUB_PUSH_AUDIENCE` estiver vazia, a validação do OIDC fica **desligada** (só para dev
+> local). Em produção ela é **obrigatória** — o endpoint `/v1/events/resultado` passa a aceitar apenas
+> entregas assinadas pela service account do push.
 
 Rodar o relay periodicamente (Cloud Run job / Cloud Scheduler, ou um systemd timer na VM) chamando
 `app.events.relay.relay_once()`. Enquanto `EVENTS_PUBLISH_ENABLED=false`, a outbox apenas acumula com

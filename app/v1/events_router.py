@@ -11,20 +11,21 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.session import get_db
 from app.events.inbound import decode_pubsub_push
+from app.events.oidc import verify_pubsub_push
 from app.events.results_consumer import consolidate_result
 
 router = APIRouter(prefix="/events", tags=["v1-events"])
 
 
-@router.post("/resultado")
+@router.post("/resultado", dependencies=[Depends(verify_pubsub_push)])
 async def on_resultado(
     request: Request,
     db: Annotated[AsyncSession, Depends(get_db)],
 ):
     """Consumidor de `resultado.aluno.v1` (push do Pub/Sub).
 
-    TODO (segurança): validar o token OIDC do Pub/Sub (settings.pubsub_push_audience) antes de
-    processar — o endpoint só deve aceitar entregas da assinatura, não POST de qualquer origem.
+    Segurança: `verify_pubsub_push` valida o token OIDC da assinatura (quando a audiência está
+    configurada), para o endpoint só aceitar entregas do Pub/Sub, não POST de qualquer origem.
     """
     body = await request.json()
     try:

@@ -164,6 +164,17 @@ class Settings(BaseSettings):
         default=False,
         description="Liga o relay da outbox. Falso até os tópicos Pub/Sub existirem (ver docs/infra-gcp.md).",
     )
+    pubsub_push_audience: str | None = Field(
+        default=None,
+        description=(
+            "Audiência do token OIDC que o Pub/Sub envia no push (normalmente a URL do endpoint). "
+            "Quando definida, o endpoint de push EXIGE e valida o OIDC; vazia = validação desligada (dev)."
+        ),
+    )
+    pubsub_push_service_account: str | None = Field(
+        default=None,
+        description="E-mail da service account que o Pub/Sub usa no push; se definido, o OIDC precisa bater.",
+    )
 
     @model_validator(mode="after")
     def _validate_attendance_storage(self):
