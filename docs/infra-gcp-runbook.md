@@ -13,7 +13,7 @@ Passo a passo para subir o **central** (VM + Cloud SQL) e o **barramento**, e o 
 export PROJECT=studious-union-475223-m8
 export REGION=southamerica-east1
 export ZONE=southamerica-east1-b
-export CENTRAL_DOMAIN=central.parametropedagogico.com   # ajuste
+export CENTRAL_DOMAIN=plataforma.parametropedagogico.com   # ajuste
 gcloud config set project "$PROJECT"
 export PROJECT_NUMBER=$(gcloud projects describe "$PROJECT" --format='value(projectNumber)')
 

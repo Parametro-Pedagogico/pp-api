@@ -65,6 +65,15 @@ Cada serviço tem a sua SA, com o **mínimo** necessário:
 6. Demais satélites, um a um. **Envio** entra por último (anexar SA à VM dele; trocar o CSV manual por
    evento), sem downtime para as escolas.
 
+## Domínios
+
+- **`app.parametropedagogico.com`** = **frontend** (`pp-app`), já no ar — **intocado**.
+- **`plataforma.parametropedagogico.com`** = **central** (`pp-api`), API/consumidor de resultado — subdomínio
+  **novo** apontando para a VM do central (um registro A → IP fixo `pp-central-ip`). Sem rename, sem downtime.
+- Satélites em Cloud Run usam as URLs `*.run.app` (ou domínios próprios depois); não precisam de subdomínio agora.
+- O frontend aponta a base da API para `https://plataforma.parametropedagogico.com`, que entra no
+  `CORS_ORIGINS` do central junto com `https://app.parametropedagogico.com`.
+
 ## Decisões confirmadas
 
 - **Satélites em Cloud Run** (escala a zero, isolados, acordam no push). ✅
