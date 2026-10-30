@@ -10,6 +10,7 @@ from app.v1.auth_providers_router import router as auth_providers_router
 from app.v1.school_settings_router import router as school_settings_router
 from app.v1.catalog_router import router as catalog_router
 from app.v1.directory_router import router as directory_router
+from app.v1.events_router import router as events_router
 from app.v1.exam_report_router import router as exam_report_router
 from app.v1.hardcut_router import router as hardcut_router
 from app.v1.me.router import router as me_router
@@ -41,3 +42,4 @@ router.include_router(assistant_router, tags=["v1-assistant"])
 router.include_router(chat_router, tags=["v1-chat"])
 router.include_router(bot_admin_router, tags=["v1-bot-admin"])
 router.include_router(hardcut_router, tags=["v1-hardcut"])
+router.include_router(events_router, tags=["v1-events"])
