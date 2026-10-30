@@ -12,6 +12,7 @@ from typing import Any
 
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from app.events.scale import enrich_result_scale
 from app.v1._sql import fetch_all
 
 _REQUIRED = ("prova_id", "schedule_id", "aluno_id")
@@ -57,6 +58,9 @@ async def consolidate_result(db: AsyncSession, data: dict[str, Any]) -> str:
     for k in _REQUIRED:
         if not data.get(k):
             raise ValueError(f"resultado sem campo obrigatório: {k}")
+
+    # Opção A: central aplica a escala da avaliação, preenchendo proficiência/nível (no lugar).
+    await enrich_result_scale(db, data)
 
     params = {
         "prova_id": str(data["prova_id"]),
