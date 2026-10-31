@@ -1,7 +1,0 @@
-# Caddy no host da VM do central. HTTPS automático; proxy para o container da API (localhost:8000).
-# Troque o domínio. O endpoint /v1/events/resultado é o alvo do push do Pub/Sub (protegido por OIDC na app).
-
-plataforma.parametropedagogico.com {
-	encode gzip
-	reverse_proxy 127.0.0.1:8000
-}

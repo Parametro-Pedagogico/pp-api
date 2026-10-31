@@ -1,27 +1,26 @@
-# Implantação do central (pp-api)
+# Implantação do central (pp-api) — Cloud Run
 
-Central na **VM dedicada** (São Paulo) + **Cloud SQL** (Postgres gerenciado), atrás do Caddy. Ver a
-topologia em [`../docs/infra-topologia.md`](../docs/infra-topologia.md) e os comandos GCP (tópicos,
-assinaturas, IAM, bucket) em [`../docs/infra-gcp.md`](../docs/infra-gcp.md).
+Tudo em **Cloud Run + Cloud SQL + Pub/Sub**, sem VM. O central é um serviço Cloud Run público (o frontend
+e o push do Pub/Sub o chamam; a autenticação é da própria app — Firebase + OIDC no endpoint de resultado).
+O **relay** da outbox roda como **Cloud Run Job** disparado pelo **Cloud Scheduler**.
 
-> Nenhum dado pessoal, segredo ou IP entra no Git. `.env` fica fora do versionamento.
+Topologia: [`../docs/infra-topologia.md`](../docs/infra-topologia.md) · Passo a passo:
+[`../docs/infra-gcp-runbook.md`](../docs/infra-gcp-runbook.md).
+
+> Nenhum segredo entra no Git. Use `--set-secrets` (Secret Manager) para `JWT_SECRET`,
+> `REFRESH_TOKEN_PEPPER`, senha do banco e `FIREBASE_PRIVATE_KEY`.
 
 ## Arquivos
 
-- `docker-compose.yml` — Cloud SQL Auth Proxy + API (uvicorn) + **relay** da outbox.
-- `env.producao.modelo` — variáveis; copie para `.env` e preencha (segredos via Secret Manager de
-  preferência).
-- `Caddyfile.modelo` — HTTPS + proxy para a API.
+- `env.cloudrun.modelo` — variáveis do serviço (referência para `--set-env-vars` / `--set-secrets`).
+- O `Dockerfile` (raiz do repo) serve para o **serviço** e para o **Job** do relay (muda só o comando).
 
-## Passos (resumo)
+## Resumo
 
-1. **Cloud SQL**: criar a instância `pp-central` (Postgres), o banco `pp_db` e o usuário da app; aplicar as
-   migrations de `migrations/` (uma vez).
-2. **VM dedicada**: criar a VM (São Paulo) **com service account anexada** (Pub/Sub + Storage + Cloud SQL
-   Client), instalar Docker e Caddy.
-3. `cp env.producao.modelo .env` e preencher; `docker compose up -d --build`.
-4. Configurar o Caddy (`Caddyfile.modelo`) com o domínio do central.
-5. **Barramento**: criar tópicos/assinaturas e a SA do push (ver `infra-gcp.md`); então
-   `EVENTS_PUBLISH_ENABLED=true` e preencher `PUBSUB_PUSH_AUDIENCE`.
+- **Serviço** `plataforma`: `gcloud run deploy plataforma --source . --allow-unauthenticated`
+  `--add-cloudsql-instances=<connectionName> --service-account=<central-sa> --min-instances=1`.
+- **Domínio**: `gcloud run domain-mappings create` para `plataforma.parametropedagogico.com`.
+- **Relay**: Cloud Run Job `relay` (comando `python -m app.events.relay_job`) + Cloud Scheduler (1 min).
+- **Migrations**: uma vez, via Cloud SQL Auth Proxy + `psql` (Cloud Shell), conforme `migrations/README.md`.
 
-A VM do **envio** não é tocada nesta etapa.
+Comandos completos no [runbook](../docs/infra-gcp-runbook.md).

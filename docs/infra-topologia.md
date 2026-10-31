@@ -9,17 +9,22 @@ outros**.
 
 Projeto **`studious-union-475223-m8`** · Região **`southamerica-east1`** (zona `-b`).
 
-**Compute Engine**
-- VM **`pp-central`** — e2-standard-2, Ubuntu 24.04, disco 30 GB pd-balanced, shielded, deletion-protection;
-  tag `pp-central`; **SA anexada** `pp-central@`; scopes `cloud-platform`. Roda Docker (compose:
-  cloud-sql-proxy + api + relay) e Caddy no host.
-- IP estático **`pp-central-ip`** (regional) — alvo do DNS `plataforma.parametropedagogico.com`.
-- Firewall **`pp-central-web`** — permite TCP 80/443 na tag `pp-central`.
+**Cloud Run (central)**
+- Serviço **`plataforma`** (pp-api) — **público** (o frontend e o push o chamam; auth pela app:
+  Firebase + OIDC no endpoint de resultado), SA `pp-central@`, conector do Cloud SQL
+  (`--add-cloudsql-instances`), `min-instances=1` (sempre quente, sem cold start no app).
+- Job **`relay`** (mesma imagem, comando `python -m app.events.relay_job`) + **Cloud Scheduler**
+  `relay-tick` (a cada 1 min) — publica a outbox. Sem processo sempre ligado.
+- Domínio `plataforma.parametropedagogico.com` via *domain mapping* (ou LB externo com NEG serverless).
+- **Sem VM, sem IP fixo, sem Caddy, sem firewall de VM.**
 
 **Cloud SQL**
 - Instância **`pp-central`** (Postgres 16, `db-custom-2-7680`, 20 GB auto-increase, ZONAL).
 - Database **`pp_db`**, usuário **`pp_app`**. connectionName:
-  `studious-union-475223-m8:southamerica-east1:pp-central` (usado pelo Auth Proxy).
+  `studious-union-475223-m8:southamerica-east1:pp-central` (usado pelo conector do Cloud Run).
+
+**Secret Manager** (segredos do central)
+- `pp-database-url`, `pp-jwt-secret`, `pp-refresh-pepper`, `pp-firebase-key` — lidos pela SA `pp-central@`.
 
 **Pub/Sub**
 - Tópicos: **`replicacao`**, **`resultados`**, **`replicacao-dlq`**, **`resultados-dlq`**.
@@ -35,49 +40,46 @@ Projeto **`studious-union-475223-m8`** · Região **`southamerica-east1`** (zona
 
 | Service account | Papéis |
 |---|---|
-| `pp-central@` (VM) | `cloudsql.client` (projeto) · `pubsub.publisher` em `replicacao` · `storage.objectViewer` no bucket |
-| `pubsub-push@` (OIDC do push) | recebe `iam.serviceAccountTokenCreator` do agente Pub/Sub · (nos satélites) `run.invoker` |
+| `pp-central@` (central, Cloud Run) | `cloudsql.client` · `pubsub.publisher` em `replicacao` · `storage.objectAdmin` no bucket · `secretmanager.secretAccessor` nos segredos · `run.invoker` no Job `relay` (Scheduler) |
+| `pubsub-push@` (OIDC do push) | recebe `iam.serviceAccountTokenCreator` do agente Pub/Sub · `run.invoker` nos satélites |
 | `service-<NUM>@gcp-sa-pubsub` (agente gerenciado) | `pubsub.publisher` nos DLQs · tokenCreator sobre `pubsub-push` |
 | `<sat>-sa@` (por satélite, depois) | `pubsub.publisher` em `resultados` · `storage.objectAdmin` no bucket se gravar |
 
-**Cloud Run** (fase seguinte) — um serviço por satélite (`calculadora`, `aplicacao-digital`, `producao`,
-`boletins`; o motor já é o `cat-cloud-function`), `--no-allow-unauthenticated`, `min-instances=0` (motor e
-aplicação: `1` só nas janelas do TAI).
+**Cloud Run (satélites, fase seguinte)** — um serviço por satélite (`calculadora`, `aplicacao-digital`,
+`producao`, `boletins`; o motor já é o `cat-cloud-function`), `--no-allow-unauthenticated`,
+`min-instances=0` (motor e aplicação: `1` só nas janelas do TAI).
 
-**DNS** — A record **`plataforma.parametropedagogico.com`** → IP de `pp-central-ip`. **`app.` permanece o
-frontend**, inalterado.
-
-**Secret Manager** (opcional) — `pp-db-password`, acessível pela SA `pp-central@`.
+**DNS** — `plataforma.parametropedagogico.com` via **domain mapping** do Cloud Run (registros que o
+`domain-mappings describe` indicar). **`app.` permanece o frontend**, inalterado.
 
 **Custo (ordem de grandeza) e o que é pago x grátis**
 
 | Recurso | Cobrança | Estimativa |
 |---|---|---|
-| VM `pp-central` (e2-standard-2, 24/7) | por hora ligada | ~US$ 50–60/mês |
+| Central no Cloud Run (`min-instances=1`, 1 vCPU/512Mi) | por tempo ativo | ~US$ 15–25/mês |
 | Cloud SQL `pp-central` (2 vCPU/7,5 GB, 24/7) | por hora + storage + backup | ~US$ 70–100/mês |
-| IP estático | por mês | ~US$ 3–7/mês |
-| Bucket, Pub/Sub, Secret Manager | por uso (quase zero parado) | centavos no início |
-| Service accounts, IAM, firewall, APIs, DNS A | **grátis** | — |
-| Satélites em Cloud Run (fase 2) | por requisição; **zero parado** | ~US$ 0 ocioso |
+| Relay (Job 1×/min) | por execução (segundos) | centavos/mês |
+| Bucket, Pub/Sub, Secret Manager, Scheduler | por uso | centavos no início |
+| Service accounts, IAM, APIs, DNS, domain mapping | **grátis** | — |
+| Satélites em Cloud Run | por requisição; **zero parado** | ~US$ 0 ocioso |
 
-> O custo fixo real é a **VM + Cloud SQL** (ambos sempre ligados). O resto é barato ou grátis. Para cortar
-> custo no começo, dá para começar o Cloud SQL menor (`db-g1-small`) e a VM `e2-small`, e subir depois.
+> O custo fixo real é o **Cloud SQL** (fonte da verdade, sempre ligado) + a instância mínima do central.
+> Não há VM nem IP fixo. Para cortar mais no começo: Cloud SQL `db-g1-small` e central `min-instances=0`
+> (aceitando cold start no 1º request).
 
 ### Como se conectam
 
 ```mermaid
 flowchart TD
-    DNS["DNS A: plataforma.parametropedagogico.com"] --> IP["IP fixo pp-central-ip"]
-    IP --> CADDY["Caddy :443 (VM pp-central)"]
-    CADDY --> API["container api (uvicorn :8000)"]
-    API --> PROXY["cloud-sql-proxy :5432"]
-    PROXY --> SQL["Cloud SQL pp-central / pp_db"]
-    RELAY["container relay (outbox)"] --> SQL
-    RELAY -->|publica| TREP["tópico replicacao"]
-    API -->|publica| TREP
+    FE["frontend (app.parametropedagogico.com)"] -->|HTTPS| CR["Cloud Run: plataforma (central)"]
+    DNS["domain mapping: plataforma.parametropedagogico.com"] --> CR
+    CR -->|conector| SQL["Cloud SQL pp-central / pp_db"]
+    JOB["Cloud Run Job relay (Scheduler 1/min)"] --> SQL
+    JOB -->|publica| TREP["tópico replicacao"]
+    CR -->|publica| TREP
     TREP -->|push| SAT["satélites (Cloud Run)"]
     SAT -->|publica| TRES["tópico resultados"]
-    TRES -->|push OIDC| API
+    TRES -->|push OIDC| CR
     GEN["produção/boletins (Cloud Run)"] --> BUCKET["bucket artefatos-provas"]
     BUCKET --> SAT
 ```
@@ -86,7 +88,7 @@ flowchart TD
 
 | Serviço | Onde | Estado atual | Observação |
 |---|---|---|---|
-| **Central** (`pp-api`) | **VM dedicada** (São Paulo) + **Cloud SQL** (Postgres gerenciado) | a provisionar | Fonte da verdade, sempre ligada; roda o **relay** da outbox; Caddy para HTTPS |
+| **Central** (`pp-api`) | **Cloud Run** (público, `min-instances=1`) + **Cloud SQL** | a provisionar | Fonte da verdade; relay como **Cloud Run Job + Scheduler**; HTTPS/domínio gerenciados |
 | **Motor de TRI** (`cat-cloud-function`) | **Cloud Run** | existe (Cloud Run) | Escala a zero; no TAI, `min-instances≥1` só nas janelas de aplicação (cold start) |
 | **Aplicação digital** (fixa+TAI) | **Cloud Run** | a construir | Escala a zero; chama o motor direto |
 | **Produção de provas** | **Cloud Run** (worker) | a construir | Geração pesada sob demanda; escala a zero |
@@ -95,18 +97,20 @@ flowchart TD
 | **Envio** (`app_enviar_provas`) | **VM própria atual, intocada** | em produção | Escolas enviando agora; integra ao barramento depois |
 | **Barramento** (Pub/Sub), **artefatos** (Cloud Storage), **banco central** (Cloud SQL) | Gerenciados | a provisionar | — |
 
-## Por que Cloud Run nos satélites (e VM no central)
+## Por que tudo Cloud Run
 
 - **Custo zero ocioso + acordar sob demanda:** Cloud Run escala a zero e **recebe o push** do Pub/Sub a
-  qualquer hora. Uma **VM parada não recebe push** (não acorda sozinha) e, ligada, custa 24/7 — logo não
-  atende "usar só quando precisar". Por isso satélites = Cloud Run.
-- **Isolamento e blast radius:** cada satélite é um serviço Cloud Run próprio, com seu repo, deploy e
-  (quando tem estado) seu banco. Parar ou implantar um não toca os demais.
-- **Central em VM dedicada:** é a fonte da verdade, precisa estar **sempre ligada** (serve o frontend,
-  publica replicação, consome resultado) e com **banco gerenciado** (Cloud SQL, backup/HA). O relay da
-  outbox roda junto do central.
-- **Latência do TAI:** o motor é o único sensível a cold start; cobre-se com `min-instances≥1` **só** nas
+  qualquer hora. Os satélites não pagam nada parados.
+- **Central também no Cloud Run:** é um FastAPI stateless; `min-instances=1` o mantém **quente** (sem cold
+  start no app) por bem menos que uma VM, sem máquina para manter (patches, Caddy, cert). Mais barato e
+  menos operação.
+- **Isolamento e blast radius:** cada serviço Cloud Run é próprio (repo, deploy, SA, banco quando tem).
+  Parar ou implantar um não toca os demais.
+- **Relay sem processo sempre ligado:** Cloud Run Job disparado pelo Scheduler (1/min) — latência de
+  replicação ≤ 1 min, aceitável para dado mestre.
+- **Latência do TAI:** o motor é o mais sensível a cold start; cobre-se com `min-instances≥1` **só** nas
   janelas de aplicação.
+- **Único custo fixo:** o **Cloud SQL** (fonte da verdade) + a instância mínima do central.
 
 ## Identidades (service accounts) — uma por serviço
 
@@ -114,16 +118,16 @@ Cada serviço tem a sua SA, com o **mínimo** necessário:
 
 | Serviço | Papéis |
 |---|---|
-| Central (VM) | `pubsub.publisher` (replicação), `pubsub.subscriber`/`run.invoker` conforme o consumo, `cloudsql.client`, `storage.objectViewer` |
+| Central (Cloud Run) | `cloudsql.client`, `pubsub.publisher` (replicação), `storage.objectAdmin`, `secretmanager.secretAccessor`, `run.invoker` no Job `relay` |
 | Satélites (Cloud Run) | `pubsub.publisher` (resultados), `storage.objectAdmin`/`Viewer` no bucket conforme o papel |
-| Pub/Sub push | `pubsub-push` (OIDC) com `run.invoker` nos serviços Cloud Run; e autorizada no endpoint do central |
+| Pub/Sub push | `pubsub-push` (OIDC) com `run.invoker` nos satélites; o central valida o OIDC na app |
 
-> O push do Pub/Sub carrega um **token OIDC**; o central já valida (`verify_pubsub_push`) e os serviços
-> Cloud Run exigem `run.invoker` para a SA do push.
+> O push do Pub/Sub carrega um **token OIDC**; o central valida (`verify_pubsub_push`) e os satélites
+> (privados) exigem `run.invoker` para a SA do push.
 
 ## Rede e entrega
 
-- **Frontend → central**: HTTPS no Caddy da VM do central.
+- **Frontend → central**: HTTPS no serviço Cloud Run `plataforma` (domínio mapeado).
 - **Central → satélites (replicação)**: via Pub/Sub (tópico `replicacao`), push nas assinaturas de cada
   satélite (URL do Cloud Run).
 - **Satélites → central (resultado)**: via Pub/Sub (tópico `resultados`), push no central
@@ -133,29 +137,30 @@ Cada serviço tem a sua SA, com o **mínimo** necessário:
 
 ## Ordem de provisionamento (central primeiro)
 
-1. **Cloud SQL** (Postgres) + banco do central; aplicar as migrations.
-2. **VM dedicada do central** (São Paulo) + Docker + Caddy; subir `pp-api` + **relay**; SA do central.
-3. **Barramento**: tópicos `replicacao`/`resultados` (+ DLQ); SA `pubsub-push`; **bucket** de artefatos.
-4. **Ligar o central**: `EVENTS_PUBLISH_ENABLED=true`, `PUBSUB_*`, `PUBSUB_PUSH_AUDIENCE`; assinatura
-   `resultados-central` → `/v1/events/resultado`.
-5. **Satélite-piloto (calculadora)** em Cloud Run: valida replicação → resultado ponta a ponta.
-6. Demais satélites, um a um. **Envio** entra por último (anexar SA à VM dele; trocar o CSV manual por
+1. **Cloud SQL** (Postgres) + banco; **segredos** no Secret Manager; **migrations** via Cloud Shell.
+2. **Service accounts** + **tópicos/DLQ** + **bucket**.
+3. **Central no Cloud Run** (`plataforma`, público, `min-instances=1`) + **domain mapping**.
+4. **Relay**: Cloud Run Job + Cloud Scheduler (1/min).
+5. **Assinatura** `resultados-central` → `/v1/events/resultado` (OIDC).
+6. **Satélite-piloto (calculadora)** em Cloud Run: valida replicação → resultado ponta a ponta.
+7. Demais satélites, um a um. **Envio** entra por último (anexar SA à VM dele; trocar o CSV manual por
    evento), sem downtime para as escolas.
 
 ## Domínios
 
 - **`app.parametropedagogico.com`** = **frontend** (`pp-app`), já no ar — **intocado**.
 - **`plataforma.parametropedagogico.com`** = **central** (`pp-api`), API/consumidor de resultado — subdomínio
-  **novo** apontando para a VM do central (um registro A → IP fixo `pp-central-ip`). Sem rename, sem downtime.
+  **novo**, mapeado no serviço Cloud Run `plataforma` (*domain mapping*). Sem rename, sem downtime.
 - Satélites em Cloud Run usam as URLs `*.run.app` (ou domínios próprios depois); não precisam de subdomínio agora.
 - O frontend aponta a base da API para `https://plataforma.parametropedagogico.com`, que entra no
   `CORS_ORIGINS` do central junto com `https://app.parametropedagogico.com`.
 
 ## Decisões confirmadas
 
-- **Satélites em Cloud Run** (escala a zero, isolados, acordam no push). ✅
-- **Central em VM dedicada + Cloud SQL** (banco gerenciado, separado). ✅
-- Região do Cloud SQL e da VM: **São Paulo** (`southamerica-east1`), perto das escolas e do envio. ✅
-- **Envio intocado** nesta etapa.
+- **Tudo em Cloud Run** — satélites **e** o central (FastAPI stateless), escala a zero / `min-instances=1`. ✅
+- **Cloud SQL** gerenciado como banco do central (fonte da verdade). ✅
+- Relay como **Cloud Run Job + Scheduler**; sem VM, sem IP fixo, sem Caddy. ✅
+- Região: **São Paulo** (`southamerica-east1`). ✅
+- **Envio intocado** nesta etapa (segue na VM dele).
 
 Provisionamento: ver o [runbook](infra-gcp-runbook.md).
