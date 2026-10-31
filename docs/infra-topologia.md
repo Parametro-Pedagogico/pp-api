@@ -5,6 +5,69 @@ Como o ecossistema roda em produção. Decidido com os sócios; o passo a passo 
 **isolamento por serviço**, **custo ≈ zero quando ocioso** e **parar/implantar um serviço sem afetar os
 outros**.
 
+## Inventário de recursos no GCP (o que o runbook cria)
+
+Projeto **`studious-union-475223-m8`** · Região **`southamerica-east1`** (zona `-b`).
+
+**Compute Engine**
+- VM **`pp-central`** — e2-standard-2, Ubuntu 24.04, disco 30 GB pd-balanced, shielded, deletion-protection;
+  tag `pp-central`; **SA anexada** `pp-central@`; scopes `cloud-platform`. Roda Docker (compose:
+  cloud-sql-proxy + api + relay) e Caddy no host.
+- IP estático **`pp-central-ip`** (regional) — alvo do DNS `plataforma.parametropedagogico.com`.
+- Firewall **`pp-central-web`** — permite TCP 80/443 na tag `pp-central`.
+
+**Cloud SQL**
+- Instância **`pp-central`** (Postgres 16, `db-custom-2-7680`, 20 GB auto-increase, ZONAL).
+- Database **`pp_db`**, usuário **`pp_app`**. connectionName:
+  `studious-union-475223-m8:southamerica-east1:pp-central` (usado pelo Auth Proxy).
+
+**Pub/Sub**
+- Tópicos: **`replicacao`**, **`resultados`**, **`replicacao-dlq`**, **`resultados-dlq`**.
+- Assinatura **`resultados-central`** → push `https://plataforma.parametropedagogico.com/v1/events/resultado`
+  (OIDC `pubsub-push`, DLQ `resultados-dlq`, max 10 entregas, ack 30 s).
+- *Depois, por satélite:* `replicacao-<sat>` → push na URL do Cloud Run do satélite.
+
+**Cloud Storage**
+- Bucket **`studious-union-475223-m8-artefatos-provas`** (regional, uniform access). Central lê;
+  produção/boletins escrevem (quando existirem).
+
+**Service accounts e IAM**
+
+| Service account | Papéis |
+|---|---|
+| `pp-central@` (VM) | `cloudsql.client` (projeto) · `pubsub.publisher` em `replicacao` · `storage.objectViewer` no bucket |
+| `pubsub-push@` (OIDC do push) | recebe `iam.serviceAccountTokenCreator` do agente Pub/Sub · (nos satélites) `run.invoker` |
+| `service-<NUM>@gcp-sa-pubsub` (agente gerenciado) | `pubsub.publisher` nos DLQs · tokenCreator sobre `pubsub-push` |
+| `<sat>-sa@` (por satélite, depois) | `pubsub.publisher` em `resultados` · `storage.objectAdmin` no bucket se gravar |
+
+**Cloud Run** (fase seguinte) — um serviço por satélite (`calculadora`, `aplicacao-digital`, `producao`,
+`boletins`; o motor já é o `cat-cloud-function`), `--no-allow-unauthenticated`, `min-instances=0` (motor e
+aplicação: `1` só nas janelas do TAI).
+
+**DNS** — A record **`plataforma.parametropedagogico.com`** → IP de `pp-central-ip`. **`app.` permanece o
+frontend**, inalterado.
+
+**Secret Manager** (opcional) — `pp-db-password`, acessível pela SA `pp-central@`.
+
+### Como se conectam
+
+```mermaid
+flowchart TD
+    DNS["DNS A: plataforma.parametropedagogico.com"] --> IP["IP fixo pp-central-ip"]
+    IP --> CADDY["Caddy :443 (VM pp-central)"]
+    CADDY --> API["container api (uvicorn :8000)"]
+    API --> PROXY["cloud-sql-proxy :5432"]
+    PROXY --> SQL["Cloud SQL pp-central / pp_db"]
+    RELAY["container relay (outbox)"] --> SQL
+    RELAY -->|publica| TREP["tópico replicacao"]
+    API -->|publica| TREP
+    TREP -->|push| SAT["satélites (Cloud Run)"]
+    SAT -->|publica| TRES["tópico resultados"]
+    TRES -->|push OIDC| API
+    GEN["produção/boletins (Cloud Run)"] --> BUCKET["bucket artefatos-provas"]
+    BUCKET --> SAT
+```
+
 ## Quem roda onde
 
 | Serviço | Onde | Estado atual | Observação |
