@@ -49,6 +49,20 @@ frontend**, inalterado.
 
 **Secret Manager** (opcional) — `pp-db-password`, acessível pela SA `pp-central@`.
 
+**Custo (ordem de grandeza) e o que é pago x grátis**
+
+| Recurso | Cobrança | Estimativa |
+|---|---|---|
+| VM `pp-central` (e2-standard-2, 24/7) | por hora ligada | ~US$ 50–60/mês |
+| Cloud SQL `pp-central` (2 vCPU/7,5 GB, 24/7) | por hora + storage + backup | ~US$ 70–100/mês |
+| IP estático | por mês | ~US$ 3–7/mês |
+| Bucket, Pub/Sub, Secret Manager | por uso (quase zero parado) | centavos no início |
+| Service accounts, IAM, firewall, APIs, DNS A | **grátis** | — |
+| Satélites em Cloud Run (fase 2) | por requisição; **zero parado** | ~US$ 0 ocioso |
+
+> O custo fixo real é a **VM + Cloud SQL** (ambos sempre ligados). O resto é barato ou grátis. Para cortar
+> custo no começo, dá para começar o Cloud SQL menor (`db-g1-small`) e a VM `e2-small`, e subir depois.
+
 ### Como se conectam
 
 ```mermaid
