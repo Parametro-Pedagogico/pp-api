@@ -138,6 +138,8 @@ def _serialize_question(
         "exam_institute": row.get("exam_institute"),
         "area_slug": row.get("area_slug"),
         "area_name": row.get("area_name"),
+        "descriptor_code": row.get("descriptor_code"),
+        "descriptor_label": row.get("descriptor_label"),
         "parameters": row.get("parameters"),
         "metadata": row.get("metadata") or {},
         "created_at": _iso(row.get("created_at")),
@@ -578,6 +580,34 @@ async def list_difficulty_levels_v1(
     return {"items": list_difficulty_levels_meta()}
 
 
+@router.get("/meta/descriptors")
+async def list_descriptors_v1(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Descritores (tags de habilidade) que estão vinculados a algum item do banco."""
+    await _assert_questions_view(ctx, db)
+    rows = await fetch_all(
+        db,
+        """
+        SELECT qt.id::text AS id, qt.external_id AS code, qt.label AS label
+        FROM question_tag qt
+        WHERE qt.tag_type = 'skill'
+          AND EXISTS (
+            SELECT 1 FROM question_item_tag qit WHERE qit.tag_id = qt.id
+          )
+        ORDER BY qt.external_id NULLS LAST, qt.label
+        """,
+        {},
+    )
+    return {
+        "items": [
+            {"id": r.get("id"), "code": r.get("code"), "label": r.get("label")}
+            for r in rows
+        ]
+    }
+
+
 @router.get("/meta/disciplines")
 async def list_disciplines_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
@@ -647,6 +677,7 @@ async def list_question_items_v1(
     discipline_id: UUID | None = None,
     difficulty_level: str | None = None,
     question_type: str | None = None,
+    descriptor_id: UUID | None = Query(None, description="Descritor (tag de habilidade) do item"),
     irt_a_min: float | None = Query(None, description="Discriminação (a) mínima — TRI"),
     irt_a_max: float | None = Query(None, description="Discriminação (a) máxima — TRI"),
     irt_b_min: float | None = Query(None, description="Dificuldade (b) mínima — TRI"),
@@ -699,6 +730,15 @@ async def list_question_items_v1(
     if question_type:
         where.append("qi.question_type = :question_type")
         params["question_type"] = question_type
+    if descriptor_id:
+        where.append(
+            """EXISTS (
+              SELECT 1 FROM question_item_tag qit
+              WHERE qit.question_id = qi.id
+                AND qit.tag_id = CAST(:descriptor_id AS uuid)
+            )"""
+        )
+        params["descriptor_id"] = str(descriptor_id)
 
     # Filtros por valores de TRI (3PL), lidos de question_item.parameters (jsonb).
     # Aceita as duas grafias de chave (a/b/c e discrimination/difficulty/guessing).
@@ -770,13 +810,23 @@ async def list_question_items_v1(
             FROM questions_assessments qax
             JOIN assessments a ON a.id = qax.assessment_id
             WHERE qax.question_id = qi.id
-          ), '[]'::json) AS assessments
+          ), '[]'::json) AS assessments,
+          dsc.descriptor_code,
+          dsc.descriptor_label
         FROM question_item qi
         JOIN question_source qs ON qs.id = qi.source_id
         LEFT JOIN curricular_areas ca ON ca.slug = qi.area_slug
         LEFT JOIN segments seg ON seg.id = qi.segment_id
         LEFT JOIN grades g ON g.id = qi.grade_id
         LEFT JOIN disciplines disc ON disc.id = qi.discipline_id
+        LEFT JOIN LATERAL (
+          SELECT qt.external_id AS descriptor_code, qt.label AS descriptor_label
+          FROM question_item_tag qit
+          JOIN question_tag qt ON qt.id = qit.tag_id
+          WHERE qit.question_id = qi.id AND qt.tag_type = 'skill'
+          ORDER BY qt.external_id NULLS LAST
+          LIMIT 1
+        ) dsc ON TRUE
         WHERE {where_sql}
         ORDER BY qi.updated_at DESC NULLS LAST, qi.created_at DESC
         LIMIT :limit OFFSET :offset
