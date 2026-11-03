@@ -140,6 +140,8 @@ def _serialize_question(
         "area_name": row.get("area_name"),
         "descriptor_code": row.get("descriptor_code"),
         "descriptor_label": row.get("descriptor_label"),
+        "topic_code": row.get("topic_code"),
+        "topic_label": row.get("topic_label"),
         "parameters": row.get("parameters"),
         "metadata": row.get("metadata") or {},
         "created_at": _iso(row.get("created_at")),
@@ -608,6 +610,34 @@ async def list_descriptors_v1(
     }
 
 
+@router.get("/meta/topics")
+async def list_topics_v1(
+    ctx: Annotated[AuthContext, Depends(get_auth_context)],
+    db: Annotated[AsyncSession, Depends(get_db)],
+):
+    """Unidades temáticas (tags de tópico) vinculadas a algum item do banco."""
+    await _assert_questions_view(ctx, db)
+    rows = await fetch_all(
+        db,
+        """
+        SELECT qt.id::text AS id, qt.external_id AS code, qt.label AS label
+        FROM question_tag qt
+        WHERE qt.tag_type = 'topic'
+          AND EXISTS (
+            SELECT 1 FROM question_item_tag qit WHERE qit.tag_id = qt.id
+          )
+        ORDER BY qt.external_id NULLS LAST, qt.label
+        """,
+        {},
+    )
+    return {
+        "items": [
+            {"id": r.get("id"), "code": r.get("code"), "label": r.get("label")}
+            for r in rows
+        ]
+    }
+
+
 @router.get("/meta/disciplines")
 async def list_disciplines_v1(
     ctx: Annotated[AuthContext, Depends(get_auth_context)],
@@ -678,6 +708,7 @@ async def list_question_items_v1(
     difficulty_level: str | None = None,
     question_type: str | None = None,
     descriptor_id: UUID | None = Query(None, description="Descritor (tag de habilidade) do item"),
+    topic_id: UUID | None = Query(None, description="Unidade temática (tag de tópico) do item"),
     irt_a_min: float | None = Query(None, description="Discriminação (a) mínima — TRI"),
     irt_a_max: float | None = Query(None, description="Discriminação (a) máxima — TRI"),
     irt_b_min: float | None = Query(None, description="Dificuldade (b) mínima — TRI"),
@@ -739,6 +770,15 @@ async def list_question_items_v1(
             )"""
         )
         params["descriptor_id"] = str(descriptor_id)
+    if topic_id:
+        where.append(
+            """EXISTS (
+              SELECT 1 FROM question_item_tag qit
+              WHERE qit.question_id = qi.id
+                AND qit.tag_id = CAST(:topic_id AS uuid)
+            )"""
+        )
+        params["topic_id"] = str(topic_id)
 
     # Filtros por valores de TRI (3PL), lidos de question_item.parameters (jsonb).
     # Aceita as duas grafias de chave (a/b/c e discrimination/difficulty/guessing).
@@ -812,7 +852,9 @@ async def list_question_items_v1(
             WHERE qax.question_id = qi.id
           ), '[]'::json) AS assessments,
           dsc.descriptor_code,
-          dsc.descriptor_label
+          dsc.descriptor_label,
+          tpc.topic_code,
+          tpc.topic_label
         FROM question_item qi
         JOIN question_source qs ON qs.id = qi.source_id
         LEFT JOIN curricular_areas ca ON ca.slug = qi.area_slug
@@ -827,6 +869,14 @@ async def list_question_items_v1(
           ORDER BY qt.external_id NULLS LAST
           LIMIT 1
         ) dsc ON TRUE
+        LEFT JOIN LATERAL (
+          SELECT qt.external_id AS topic_code, qt.label AS topic_label
+          FROM question_item_tag qit
+          JOIN question_tag qt ON qt.id = qit.tag_id
+          WHERE qit.question_id = qi.id AND qt.tag_type = 'topic'
+          ORDER BY qt.external_id NULLS LAST
+          LIMIT 1
+        ) tpc ON TRUE
         WHERE {where_sql}
         ORDER BY qi.updated_at DESC NULLS LAST, qi.created_at DESC
         LIMIT :limit OFFSET :offset
