@@ -647,6 +647,12 @@ async def list_question_items_v1(
     discipline_id: UUID | None = None,
     difficulty_level: str | None = None,
     question_type: str | None = None,
+    irt_a_min: float | None = Query(None, description="Discriminação (a) mínima — TRI"),
+    irt_a_max: float | None = Query(None, description="Discriminação (a) máxima — TRI"),
+    irt_b_min: float | None = Query(None, description="Dificuldade (b) mínima — TRI"),
+    irt_b_max: float | None = Query(None, description="Dificuldade (b) máxima — TRI"),
+    irt_c_min: float | None = Query(None, description="Acerto ao acaso (c) mínimo — TRI"),
+    irt_c_max: float | None = Query(None, description="Acerto ao acaso (c) máximo — TRI"),
 ):
     await _assert_questions_view(ctx, db)
 
@@ -693,6 +699,34 @@ async def list_question_items_v1(
     if question_type:
         where.append("qi.question_type = :question_type")
         params["question_type"] = question_type
+
+    # Filtros por valores de TRI (3PL), lidos de question_item.parameters (jsonb).
+    # Aceita as duas grafias de chave (a/b/c e discrimination/difficulty/guessing).
+    # Cast seguro: só converte quando o texto é numérico (evita erro em valor inválido);
+    # itens sem parâmetros (não calibrados) saem do resultado quando há filtro de TRI.
+    def _irt_cast(key: str) -> str:
+        t = f"qi.parameters->>'{key}'"
+        return f"(CASE WHEN {t} ~ '^-?[0-9]+(\\.[0-9]+)?$' THEN ({t})::numeric END)"
+
+    irt_exprs = {
+        "a": f"COALESCE({_irt_cast('a')}, {_irt_cast('discrimination')})",
+        "b": f"COALESCE({_irt_cast('b')}, {_irt_cast('difficulty')})",
+        "c": f"COALESCE({_irt_cast('c')}, {_irt_cast('guessing')})",
+    }
+    irt_bounds = {
+        ("a", "min", irt_a_min, ">="),
+        ("a", "max", irt_a_max, "<="),
+        ("b", "min", irt_b_min, ">="),
+        ("b", "max", irt_b_max, "<="),
+        ("c", "min", irt_c_min, ">="),
+        ("c", "max", irt_c_max, "<="),
+    }
+    for key, bound, value, op in sorted(irt_bounds):
+        if value is None:
+            continue
+        pname = f"irt_{key}_{bound}"
+        where.append(f"{irt_exprs[key]} {op} :{pname}")
+        params[pname] = value
 
     where_sql = " AND ".join(where)
 
